@@ -4,16 +4,21 @@
 
 **Request for Comments for the [Astrid](https://github.com/unicity-astrid/astrid) agent runtime.**
 
-RFCs define standard interfaces, protocols, and type contracts that capsules and
-host runtimes implement. They are the authoritative specification - reference
-capsule implementations conform to them, not the other way around.
+RFCs govern any substantial change to the contract surface between the kernel
+and user-space: the host ABI, IPC protocol, capability model, manifest schema,
+VFS semantics, capsule interface standards, and SDK public API. They are the
+authoritative specification - implementations conform to them, not the other
+way around.
 
 ## When you need an RFC
 
-- Defining a new capsule interface (tool schemas, input/output types)
-- Changing an existing capsule protocol in a breaking way
-- Introducing a new host function or IPC message format
-- Standardizing cross-capsule communication patterns
+- Adding or changing a host function in the syscall table (`astrid-sys`)
+- Changing IPC topic conventions or payload schemas
+- Modifying the capability token format or validation semantics
+- Changing `Capsule.toml` manifest schema or dependency resolution
+- Changing VFS path resolution rules or overlay behavior
+- Defining a new capsule interface standard (tool schemas, cross-capsule contracts)
+- Breaking changes to `astrid-sdk` public API
 
 ## Process
 
@@ -50,7 +55,7 @@ astrid-sdk = { version = "0.2", features = ["all-rfcs"] }
 
 | RFC | Title | Status |
 |-----|-------|--------|
-| | No RFCs accepted yet. | |
+| [0001](text/0001-rfc-process.md) | RFC Process | Active |
 
 ## License
 

@@ -1,6 +1,6 @@
 - Feature Name: (fill with a unique identifier, `my_feature_name`)
 - Start Date: (fill with today's date, YYYY-MM-DD)
-- RFC PR: [astrid-rfcs#0000](https://github.com/unicity-astrid/astrid-rfcs/pull/0000)
+- RFC PR: [rfcs#0000](https://github.com/unicity-astrid/rfcs/pull/0000)
 - Tracking Issue: [astrid#0000](https://github.com/unicity-astrid/astrid/issues/0000)
 
 # Summary
