@@ -1,0 +1,14 @@
+[book]
+title = "The Astrid RFC Book"
+
+[output.html]
+smart-punctuation = true
+no-section-label = true
+git-repository-url = "https://github.com/unicity-astrid/rfcs"
+site-url = "/rfcs/"
+
+[output.html.search]
+heading-split-level = 0
+
+[build]
+extra-watch-dirs = ["text"]
