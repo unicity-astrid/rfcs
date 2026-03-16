@@ -2,7 +2,7 @@
 
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
 
-**Request for Comments for the [Astrid](https://github.com/unicity-astrid/astrid) agent runtime.**
+**Design proposals for changes to [Astrid's](https://github.com/unicity-astrid/astrid) kernel-to-user-space contract.**
 
 RFCs govern any substantial change to the contract surface between the kernel
 and user-space: the host ABI, IPC protocol, capability model, manifest schema,
