@@ -84,144 +84,70 @@ directory, transparently.
 # Reference-level explanation
 [reference-level-explanation]: #reference-level-explanation
 
+## Canonical spec
+
+The authoritative function-level specification is the WIT file:
+[`core/wit/astrid-capsule.wit`](https://github.com/unicity-astrid/astrid/blob/main/wit/astrid-capsule.wit)
+
+This RFC documents the design rationale, capability model, and scoping
+semantics. The WIT file is the reference for function signatures and types.
+If this RFC and the WIT file disagree, the WIT file is correct.
+
 ## Host interfaces
 
-The canonical WIT spec lives at
-[`core/wit/astrid-capsule.wit`](https://github.com/unicity-astrid/astrid/blob/main/wit/astrid-capsule.wit).
-This section summarizes each interface.
+51 host functions organized into 12 domain interfaces:
 
-### `types` — Shared types
+| Interface | Functions | Capability | Purpose |
+|---|---|---|---|
+| `fs` | 7 | `fs_read`, `fs_write` | Virtual filesystem (workspace://, home://, tmp://) |
+| `ipc` | 6 | `ipc_publish`, `ipc_subscribe` | IPC event bus: publish, subscribe, receive |
+| `uplink` | 2 | `uplink` | Frontend connection registration and response sending |
+| `kv` | 5 | (ungated) | Per-capsule key-value store, auto-scoped per principal |
+| `net` | 6 | `net` | Unix socket I/O for capsule-to-daemon communication |
+| `http` | 4 | `net` | HTTP client with streaming (SSE) support |
+| `sys` | 7 | (ungated) | Logging, config, time, hooks, capability introspection |
+| `cron` | 2 | `cron` | Scheduled recurring tasks |
+| `process` | 4 | `host_process` | Sandboxed host process spawning (Seatbelt/bwrap) |
+| `elicit` | 2 | `uplink` | Interactive user input (prompts, selections) |
+| `approval` | 1 | (ungated) | Human-in-the-loop approval gates |
+| `identity` | 5 | `identity` | User identity CRUD and platform linking |
 
-Common types used across interfaces: `log-level` enum, `key-value-pair` record,
-`capsule-context` and `capsule-result` records for hook execution.
+A 13th block, `types`, defines shared types (`log-level`, `key-value-pair`,
+`capsule-context`, `capsule-result`) used across interfaces. It has no functions.
 
-### `fs` — Virtual filesystem (7 functions)
+### Capability model
 
-| Function | Description | Capability |
+Each host function checks the calling capsule's declared capabilities:
+
+- **Gated:** `fs_read`, `fs_write`, `ipc_publish`, `ipc_subscribe`, `uplink`,
+  `net`, `cron`, `host_process`, `identity`. Capsules must declare these in
+  `[capabilities]` in Capsule.toml.
+- **Ungated:** `kv`, `sys`, `approval`. Always available. KV is safe because
+  it's namespace-scoped per capsule and principal. Sys functions are read-only
+  or side-effect-free. Approval is a request, not an action.
+
+Violations return an error to the guest and are logged to the audit chain.
+
+### VFS scheme resolution
+
+The `fs` interface resolves paths through VFS schemes:
+
+| Scheme | Resolves to | Capability |
 |---|---|---|
-| `read-file` | Read file contents | `fs_read` |
-| `write-file` | Write file contents | `fs_write` |
-| `fs-readdir` | List directory entry names | `fs_read` |
-| `fs-stat` | File metadata (size, type, mtime) | `fs_read` |
-| `fs-mkdir` | Create directory | `fs_write` |
-| `fs-unlink` | Delete file | `fs_write` |
-| `fs-exists` | Check if path exists | `fs_read` |
+| `workspace://` | Project sandbox root (CWD) | `fs_read` / `fs_write` |
+| `home://` | `~/.astrid/home/{principal}/` | `fs_read` / `fs_write` |
+| `tmp://` | `~/.astrid/home/{principal}/.local/tmp/` | `fs_write` |
 
-VFS paths use scheme prefixes: `workspace://` (project sandbox), `home://`
-(principal home), `tmp://` (per-principal temp). The security gate resolves
-schemes to physical paths and enforces capability boundaries.
+The security gate resolves schemes to physical paths at capsule load time.
+Cross-scheme access is denied. A capsule with `fs_read = ["workspace://"]`
+cannot read `home://`.
 
-### `ipc` — Inter-process communication (6 functions)
+### Per-principal KV scoping
 
-| Function | Description | Capability |
-|---|---|---|
-| `ipc-publish` | Publish message to IPC bus | `ipc_publish` |
-| `ipc-subscribe` | Subscribe to topic pattern | `ipc_subscribe` |
-| `ipc-unsubscribe` | Unsubscribe from topic | `ipc_subscribe` |
-| `ipc-poll` | Check if messages are available | `ipc_subscribe` |
-| `ipc-recv` | Receive next message from subscription | `ipc_subscribe` |
-| `get-interceptor-handles` | Get handles for registered interceptors | `ipc_subscribe` |
-
-Topic patterns use dot-separated segments with single-segment wildcards (`*`).
-Messages carry `IpcPayload` variants (LLM request, tool result, custom JSON,
-etc.) and are assigned monotonic sequence numbers at publish time.
-
-### `uplink` — Frontend connection (2 functions)
-
-| Function | Description | Capability |
-|---|---|---|
-| `uplink-register` | Register as a frontend uplink | `uplink` |
-| `uplink-send` | Send response to connected client | `uplink` |
-
-Only capsules with `uplink = true` capability can use these functions.
-
-### `kv` — Key-value store (5 functions)
-
-| Function | Description | Capability |
-|---|---|---|
-| `kv-get` | Read value by key | (always allowed) |
-| `kv-set` | Write value by key | (always allowed) |
-| `kv-delete` | Remove key | (always allowed) |
-| `kv-list-keys` | List keys matching a prefix | (always allowed) |
-| `kv-clear-prefix` | Delete all keys matching a prefix | (always allowed) |
-
-KV is always available — no capability needed. Namespace is automatically
-scoped: `{principal}:capsule:{capsule_name}`. Capsules cannot access each
-other's KV data.
-
-### `net` — Raw networking (6 functions)
-
-| Function | Description | Capability |
-|---|---|---|
-| `net-bind-unix` | Bind a Unix domain socket | `net` |
-| `net-accept` | Accept connection on bound socket | `net` |
-| `net-poll-accept` | Non-blocking accept check | `net` |
-| `net-read` | Read from stream | `net` |
-| `net-write` | Write to stream | `net` |
-| `net-close-stream` | Close stream | `net` |
-
-### `http` — HTTP client (4 functions)
-
-| Function | Description | Capability |
-|---|---|---|
-| `http-request` | Blocking HTTP request | `net` |
-| `http-stream-start` | Begin streaming HTTP request (SSE) | `net` |
-| `http-stream-read` | Read next chunk from stream | `net` |
-| `http-stream-close` | Close streaming connection | `net` |
-
-### `sys` — System operations (7 functions)
-
-| Function | Description | Capability |
-|---|---|---|
-| `log` | Structured logging with level | (always allowed) |
-| `get-config` | Read capsule configuration | (always allowed) |
-| `get-caller` | Get calling principal info | (always allowed) |
-| `trigger-hook` | Fan-out hook to matching interceptors | (always allowed) |
-| `signal-ready` | Signal capsule is ready | (always allowed) |
-| `clock-ms` | Current time in milliseconds | (always allowed) |
-| `check-capsule-capability` | Query own capability grants | (always allowed) |
-
-### `cron` — Scheduled tasks (2 functions)
-
-| Function | Description | Capability |
-|---|---|---|
-| `cron-schedule` | Register a recurring task | `cron` |
-| `cron-cancel` | Cancel a scheduled task | `cron` |
-
-### `process` — Host process spawning (4 functions)
-
-| Function | Description | Capability |
-|---|---|---|
-| `spawn` | Run a command and wait for exit | `host_process` |
-| `spawn-background` | Start a background process | `host_process` |
-| `read-logs` | Read buffered output from background process | `host_process` |
-| `kill` | Terminate a background process | `host_process` |
-
-All processes run inside the platform sandbox (Seatbelt on macOS, bwrap on
-Linux). The `host_process` capability lists allowed program names.
-
-### `elicit` — Interactive user input (2 functions)
-
-| Function | Description | Capability |
-|---|---|---|
-| `elicit` | Request structured input from user (text, select, confirm) | `uplink` |
-| `has-secret` | Check if a secret is configured | (always allowed) |
-
-### `approval` — Human-in-the-loop gates (1 function)
-
-| Function | Description | Capability |
-|---|---|---|
-| `request-approval` | Request human approval for an action | (always allowed) |
-
-### `identity` — User identity (5 functions)
-
-| Function | Description | Capability |
-|---|---|---|
-| `identity-create-user` | Create a new Astrid user | `identity` |
-| `identity-resolve` | Look up user by platform link | `identity` |
-| `identity-link` | Link a platform identity to an Astrid user | `identity` |
-| `identity-unlink` | Remove a platform identity link | `identity` |
-| `identity-list-links` | List all platform links for a user | `identity` |
+KV namespace: `{principal}:capsule:{capsule_name}`. The principal is resolved
+from the invocation context (IPC message principal field), not the capsule's
+static configuration. This means the same capsule serves different KV
+namespaces depending on who is calling — transparent to the capsule author.
 
 ## Guest exports
 
@@ -229,10 +155,14 @@ Capsules export up to 4 entry points:
 
 | Export | Description | Required |
 |---|---|---|
-| `astrid-hook-trigger` | Interceptor handler — receives action + payload, returns `InterceptResult` bytes | No |
+| `astrid-hook-trigger` | Interceptor handler — receives action + payload, returns `InterceptResult` bytes (see [interceptor chain RFC](0000-interceptor-chain.md)) | No |
 | `run` | Background task entry point — capsules with run loops (IPC subscribers) | No |
-| `astrid-install` | Called once after first installation | No |
-| `astrid-upgrade` | Called after version upgrade (receives previous version) | No |
+| `astrid-install` | Called once after first installation — setup KV state, validate config | No |
+| `astrid-upgrade` | Called after version upgrade — receives previous version for migrations | No |
+
+Capsules without `run` are "on-demand" — they only execute when an interceptor
+or tool is invoked. Capsules with `run` start a background task that subscribes
+to IPC topics and processes events in a loop.
 
 ## Error handling
 
@@ -305,12 +235,31 @@ Gating these would add friction without security benefit.
 # Unresolved questions
 [unresolved-questions]: #unresolved-questions
 
-- Should the ABI version be semver-independent from the kernel version?
-  Currently they share the same version number.
-- Should `astrid_system_stats` be added for runtime metrics (per-capsule
-  memory, invocation counts, event bus throughput)? Planned for v0.6.0.
-- Should there be a `capabilities` host function that lets a capsule query
-  its own granted capabilities at runtime?
+- **ABI versioning independence.** Should the ABI version be semver-independent
+  from the kernel version? Currently the WIT package version (`0.1.0`) and the
+  kernel version (`0.5.0`) are decoupled but informally linked. A stable ABI
+  version would let capsule authors target "ABI 1.0" regardless of which kernel
+  version implements it. The counter-argument: two version numbers is confusing
+  when there's only one implementation.
+
+- **Capability introspection depth.** `check-capsule-capability` exists but is
+  limited. Should capsules be able to query the full capability set of OTHER
+  capsules? This enables a system capsule to display "what can each capsule do"
+  but leaks capability information across the sandbox boundary.
+
+- **Host function deprecation path.** When a host function needs to change
+  signature (e.g., adding a parameter), how is backward compatibility handled?
+  Options: versioned function names (`fs-read-v2`), optional parameters via
+  JSON, or a clean break with the Component Model migration.
+
+- **Audit chain integration.** Which host functions should produce audit
+  entries? Currently logging and approval are audited. Should every `fs_write`
+  be audited? Every `ipc_publish`? The audit chain grows linearly with calls —
+  full auditing could be expensive for high-throughput capsules.
+
+- **Resource limits.** Should host functions enforce resource limits (max file
+  size on `write-file`, max message size on `ipc-publish`, max KV value size)?
+  Currently unbounded — a capsule can write arbitrarily large values.
 
 # Future possibilities
 [future-possibilities]: #future-possibilities
