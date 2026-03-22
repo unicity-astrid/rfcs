@@ -299,12 +299,29 @@ recursive expansion.
 # Unresolved questions
 [unresolved-questions]: #unresolved-questions
 
-- Should `astrid init` support `--offline` mode with pre-downloaded capsules?
-- Should distros support inheritance (`extends = "astralis"`) for layered
-  customization?
-- Should the lockfile include WIT file hashes for full reproducibility?
-- Should `astrid capsule update` respect distro version pins or always fetch
-  latest?
+- **Offline installation.** Should `astrid init` support `--offline` mode with
+  pre-downloaded `.capsule` archives? Enterprise deployments behind firewalls
+  need this. The mechanism exists (local source resolution) but the UX for
+  packaging a distro for offline use doesn't.
+
+- **Distro inheritance.** Should `extends = "astralis"` allow layering? An
+  enterprise distro could inherit the base Astralis capsules and add
+  company-specific ones. Risk: inheritance creates implicit dependencies —
+  the parent distro's capsules aren't visible in the child's manifest.
+
+- **Lock scope.** The lockfile currently records capsule versions and hashes.
+  Should it also lock WIT file versions? Capsule source URLs? If the SDK repo
+  reorganizes WIT files, the lock is stale but passes freshness checks.
+
+- **Update policy.** `astrid capsule update` currently fetches the latest
+  version from the original source. Should it respect the distro's version
+  pins? If the distro says `version = "0.1.0"`, should update refuse to go
+  to `0.2.0`? Or should it update and warn about drift from the distro?
+
+- **Multi-distro.** Can a principal install capsules from multiple distros?
+  Currently the lock only records one `distro-id`. A user might want the base
+  Astralis distro plus a domain-specific extension distro (e.g., `astralis` +
+  `astralis-devops`).
 
 # Future possibilities
 [future-possibilities]: #future-possibilities
