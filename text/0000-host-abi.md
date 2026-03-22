@@ -7,7 +7,7 @@
 [summary]: #summary
 
 Define the host ABI — the syscall-like interface between the Astrid kernel and
-WASM capsule guests. 55 host functions across 13 domain interfaces, plus 4
+WASM capsule guests. 51 host functions across 12 domain interfaces, plus 4
 guest exports. All operations are capability-gated, audited, and per-principal
 scoped.
 
@@ -99,93 +99,96 @@ Common types used across interfaces: `log-level` enum, `key-value-pair` record,
 
 | Function | Description | Capability |
 |---|---|---|
-| `read` | Read file contents | `fs_read` |
-| `write` | Write file contents | `fs_write` |
-| `readdir` | List directory entries | `fs_read` |
-| `stat` | File metadata (size, type, mtime) | `fs_read` |
-| `mkdir` | Create directory | `fs_write` |
-| `remove` | Delete file | `fs_write` |
-| `exists` | Check if path exists | `fs_read` |
+| `read-file` | Read file contents | `fs_read` |
+| `write-file` | Write file contents | `fs_write` |
+| `fs-readdir` | List directory entry names | `fs_read` |
+| `fs-stat` | File metadata (size, type, mtime) | `fs_read` |
+| `fs-mkdir` | Create directory | `fs_write` |
+| `fs-unlink` | Delete file | `fs_write` |
+| `fs-exists` | Check if path exists | `fs_read` |
 
 VFS paths use scheme prefixes: `workspace://` (project sandbox), `home://`
 (principal home), `tmp://` (per-principal temp). The security gate resolves
 schemes to physical paths and enforces capability boundaries.
 
-### `ipc` — Inter-process communication (3 functions)
+### `ipc` — Inter-process communication (6 functions)
 
 | Function | Description | Capability |
 |---|---|---|
-| `publish` | Publish message to IPC bus | `ipc_publish` |
-| `subscribe` | Subscribe to topic pattern | `ipc_subscribe` |
-| `recv` | Receive next message from subscription | `ipc_subscribe` |
+| `ipc-publish` | Publish message to IPC bus | `ipc_publish` |
+| `ipc-subscribe` | Subscribe to topic pattern | `ipc_subscribe` |
+| `ipc-unsubscribe` | Unsubscribe from topic | `ipc_subscribe` |
+| `ipc-poll` | Check if messages are available | `ipc_subscribe` |
+| `ipc-recv` | Receive next message from subscription | `ipc_subscribe` |
+| `get-interceptor-handles` | Get handles for registered interceptors | `ipc_subscribe` |
 
 Topic patterns use dot-separated segments with single-segment wildcards (`*`).
 Messages carry `IpcPayload` variants (LLM request, tool result, custom JSON,
 etc.) and are assigned monotonic sequence numbers at publish time.
 
-### `uplink` — Frontend connection (3 functions)
+### `uplink` — Frontend connection (2 functions)
 
 | Function | Description | Capability |
 |---|---|---|
-| `send` | Send response to connected client | `uplink` |
-| `recv` | Receive input from client | `uplink` |
-| `ready` | Signal that the capsule is ready for input | `uplink` |
+| `uplink-register` | Register as a frontend uplink | `uplink` |
+| `uplink-send` | Send response to connected client | `uplink` |
 
 Only capsules with `uplink = true` capability can use these functions.
 
-### `kv` — Key-value store (3 functions)
+### `kv` — Key-value store (5 functions)
 
 | Function | Description | Capability |
 |---|---|---|
-| `get` | Read value by key | (always allowed) |
-| `set` | Write value by key | (always allowed) |
-| `delete` | Remove key | (always allowed) |
+| `kv-get` | Read value by key | (always allowed) |
+| `kv-set` | Write value by key | (always allowed) |
+| `kv-delete` | Remove key | (always allowed) |
+| `kv-list-keys` | List keys matching a prefix | (always allowed) |
+| `kv-clear-prefix` | Delete all keys matching a prefix | (always allowed) |
 
 KV is always available — no capability needed. Namespace is automatically
 scoped: `{principal}:capsule:{capsule_name}`. Capsules cannot access each
 other's KV data.
 
-### `net` — Raw TCP networking (5 functions)
+### `net` — Raw networking (6 functions)
 
 | Function | Description | Capability |
 |---|---|---|
-| `connect` | Open TCP connection | `net` |
-| `read` | Read from stream | `net` |
-| `write` | Write to stream | `net` |
-| `close` | Close connection | `net` |
-| `dns-resolve` | DNS lookup | `net` |
+| `net-bind-unix` | Bind a Unix domain socket | `net` |
+| `net-accept` | Accept connection on bound socket | `net` |
+| `net-poll-accept` | Non-blocking accept check | `net` |
+| `net-read` | Read from stream | `net` |
+| `net-write` | Write to stream | `net` |
+| `net-close-stream` | Close stream | `net` |
 
 ### `http` — HTTP client (4 functions)
 
 | Function | Description | Capability |
 |---|---|---|
-| `fetch` | Blocking HTTP request | `net` |
-| `stream-start` | Begin streaming HTTP request (SSE) | `net` |
-| `stream-read` | Read next chunk from stream | `net` |
-| `stream-close` | Close streaming connection | `net` |
+| `http-request` | Blocking HTTP request | `net` |
+| `http-stream-start` | Begin streaming HTTP request (SSE) | `net` |
+| `http-stream-read` | Read next chunk from stream | `net` |
+| `http-stream-close` | Close streaming connection | `net` |
 
-### `sys` — System operations (8 functions)
+### `sys` — System operations (7 functions)
 
 | Function | Description | Capability |
 |---|---|---|
 | `log` | Structured logging with level | (always allowed) |
 | `get-config` | Read capsule configuration | (always allowed) |
-| `get-env` | Read environment variable | (always allowed) |
 | `get-caller` | Get calling principal info | (always allowed) |
-| `get-time` | Current UTC timestamp | (always allowed) |
-| `random-bytes` | Cryptographic random bytes | (always allowed) |
 | `trigger-hook` | Fan-out hook to matching interceptors | (always allowed) |
-| `sleep` | Suspend execution for duration | (always allowed) |
+| `signal-ready` | Signal capsule is ready | (always allowed) |
+| `clock-ms` | Current time in milliseconds | (always allowed) |
+| `check-capsule-capability` | Query own capability grants | (always allowed) |
 
-### `cron` — Scheduled tasks (3 functions)
+### `cron` — Scheduled tasks (2 functions)
 
 | Function | Description | Capability |
 |---|---|---|
-| `schedule` | Register a recurring task | `cron` |
-| `cancel` | Cancel a scheduled task | `cron` |
-| `list` | List active scheduled tasks | `cron` |
+| `cron-schedule` | Register a recurring task | `cron` |
+| `cron-cancel` | Cancel a scheduled task | `cron` |
 
-### `process` — Host process spawning (5 functions)
+### `process` — Host process spawning (4 functions)
 
 | Function | Description | Capability |
 |---|---|---|
@@ -193,34 +196,32 @@ other's KV data.
 | `spawn-background` | Start a background process | `host_process` |
 | `read-logs` | Read buffered output from background process | `host_process` |
 | `kill` | Terminate a background process | `host_process` |
-| `list-processes` | List active background processes | `host_process` |
 
 All processes run inside the platform sandbox (Seatbelt on macOS, bwrap on
 Linux). The `host_process` capability lists allowed program names.
 
-### `elicit` — Interactive user input (3 functions)
+### `elicit` — Interactive user input (2 functions)
 
 | Function | Description | Capability |
 |---|---|---|
-| `prompt` | Request text input from user | `uplink` |
-| `select` | Present selection choices | `uplink` |
-| `confirm` | Yes/no confirmation | `uplink` |
+| `elicit` | Request structured input from user (text, select, confirm) | `uplink` |
+| `has-secret` | Check if a secret is configured | (always allowed) |
 
-### `approval` — Human-in-the-loop gates (2 functions)
-
-| Function | Description | Capability |
-|---|---|---|
-| `request` | Request human approval for an action | (always allowed) |
-| `check` | Check if an action is pre-approved | (always allowed) |
-
-### `identity` — User identity (4 functions)
+### `approval` — Human-in-the-loop gates (1 function)
 
 | Function | Description | Capability |
 |---|---|---|
-| `create-user` | Create a new Astrid user | `identity` |
-| `resolve` | Look up user by platform link | `identity` |
-| `link` | Link a platform identity to an Astrid user | `identity` |
-| `get-user` | Get user details by ID | `identity` |
+| `request-approval` | Request human approval for an action | (always allowed) |
+
+### `identity` — User identity (5 functions)
+
+| Function | Description | Capability |
+|---|---|---|
+| `identity-create-user` | Create a new Astrid user | `identity` |
+| `identity-resolve` | Look up user by platform link | `identity` |
+| `identity-link` | Link a platform identity to an Astrid user | `identity` |
+| `identity-unlink` | Remove a platform identity link | `identity` |
+| `identity-list-links` | List all platform links for a user | `identity` |
 
 ## Guest exports
 
@@ -242,8 +243,8 @@ missing capability name in the error message.
 # Drawbacks
 [drawbacks]: #drawbacks
 
-- **Large surface area.** 55 functions is a lot to maintain stable. Each one
-  is a compatibility commitment.
+- **Large surface area.** 51 host functions is a lot to maintain stable. Each
+  one is a compatibility commitment.
 - **JSON wire format overhead.** Serializing/deserializing JSON for every
   syscall is measurably slower than Component Model typed parameters. Acceptable
   pre-1.0; the migration path (WS-8) is planned.
