@@ -59,7 +59,7 @@ The agent discovers available components and composes them into a layout. Your c
 data model via IPC — the component re-renders automatically through A2UI data binding:
 
 ```rust
-sdk::publish("ui.v1.data_model.update", json!({
+sdk::publish("a2ui.data_model.update", json!({
     "surfaceId": "root",
     "patch": [
         { "op": "replace", "path": "/model-status/model", "value": "gpt-5.4" },
@@ -183,23 +183,32 @@ Unsupported components degrade to `Text` or are omitted.
 
 ### IPC topics
 
-A2UI messages travel over the IPC event bus under `ui.v1.*`:
+A2UI messages travel over the IPC event bus under `a2ui.*`:
 
 | IPC Topic | Payload | Direction |
 |-----------|---------|-----------|
-| `ui.v1.surface.create` | A2UI `createSurface` | Agent → Frontend |
-| `ui.v1.components.update` | A2UI `updateComponents` | Agent → Frontend |
-| `ui.v1.data_model.update` | A2UI `updateDataModel` | Capsule/Agent → Frontend |
-| `ui.v1.surface.delete` | A2UI `deleteSurface` | Agent → Frontend |
-| `ui.v1.action` | `{ surfaceId, componentId, action, data }` | Frontend → Agent |
-| `ui.v1.catalog.query` | `{}` | Agent → Frontend |
-| `ui.v1.catalog.response` | `{ components: [...] }` | Frontend → Agent |
+| `a2ui.surface.create` | A2UI `createSurface` | Agent → Frontend |
+| `a2ui.components.update` | A2UI `updateComponents` | Agent → Frontend |
+| `a2ui.data_model.update` | A2UI `updateDataModel` | Capsule/Agent → Frontend |
+| `a2ui.surface.delete` | A2UI `deleteSurface` | Agent → Frontend |
+| `a2ui.action` | `{ surfaceId, componentId, action, data }` | Frontend → Agent |
+| `a2ui.catalog.query` | `{}` | Agent → Frontend |
+| `a2ui.catalog.response` | `{ components: [...] }` | Frontend → Agent |
+
+### Versioning
+
+IPC topics carry no version number. A2UI messages self-describe their version via the `version`
+field in every payload (e.g., `"version": "v0.10"`). Topics are stable routing addresses; the A2UI
+spec version is a payload concern.
+
+When A2UI evolves, the frontend reads the `version` field and handles accordingly. No topic changes,
+no capsule manifest changes, no subscriber updates. This decouples IPC routing from spec evolution.
 
 ### Component discovery
 
 UI component discovery follows the same bus-based pattern as tool discovery:
 
-1. Agent triggers `ui.v1.request.describe` (hook fan-out to all capsules)
+1. Agent triggers `a2ui.request.describe` (hook fan-out to all capsules)
 2. Each capsule's `ui_describe` interceptor responds with its available components
 3. Agent collects the component registry
 
@@ -207,11 +216,11 @@ The `Capsule.toml` declares the interceptor and IPC capabilities:
 
 ```toml
 [[interceptor]]
-event = "ui.v1.request.describe"
+event = "a2ui.request.describe"
 action = "ui_describe"
 
 [capabilities]
-ipc_publish = ["ui.v1.response.describe.*"]
+ipc_publish = ["a2ui.response.describe.*"]
 ```
 
 The `ui_describe` handler returns what the capsule can provide:
@@ -261,21 +270,21 @@ The agent bridges the two — mapping capsule components onto A2UI primitives.
 
 ### Composition flow
 
-1. **Boot**: Frontend publishes `ui.v1.catalog.response` with supported A2UI component types.
-2. **Discovery**: Agent triggers `ui.v1.request.describe` — capsules respond with available
+1. **Boot**: Frontend publishes `a2ui.catalog.response` with supported A2UI component types.
+2. **Discovery**: Agent triggers `a2ui.request.describe` — capsules respond with available
    components.
 3. **Compose**: Agent emits `createSurface` + `updateComponents` with the default layout.
 4. **Interact**: On user input ("show tools sidebar"), agent emits `updateComponents` with a
    restructured tree.
-5. **Live data**: Capsules publish `ui.v1.data_model.update` to push values to their components.
+5. **Live data**: Capsules publish `a2ui.data_model.update` to push values to their components.
    Frontend re-renders via A2UI data binding.
 6. **Persist**: Agent saves layout composition to session state. On reconnect, restores last layout.
 
 ### Error handling
 
 - **Unknown component type**: Frontend renders as `Text` with the component's `id`, or omits.
-  Agent sees `ui.v1.error` and can adapt.
-- **Invalid tree structure**: Rejected with `ui.v1.error`; last valid tree retained.
+  Agent sees `a2ui.error` and can adapt.
+- **Invalid tree structure**: Rejected with `a2ui.error`; last valid tree retained.
 - **Agent not ready**: Frontend renders a minimal loading state until the first `createSurface`
   arrives. This is the only hardcoded UI in the frontend.
 
@@ -349,9 +358,6 @@ retained. Users can always say "reset to default."
 
 # Unresolved questions
 [unresolved-questions]: #unresolved-questions
-
-- **A2UI version pinning**: Which version do we adopt? v0.10 is latest draft. May need to pin
-  v0.8 (public preview) and upgrade.
 
 - **Streaming component trees**: How does incremental JSONL interact with double-buffered
   rendering? Render partial trees or wait for complete updates?
