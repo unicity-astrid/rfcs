@@ -1,6 +1,6 @@
 - Feature Name: `agent_composed_ui`
 - Start Date: 2026-03-25
-- RFC PR: [rfcs#0000](https://github.com/unicity-astrid/rfcs/pull/0000)
+- RFC PR: [rfcs#25](https://github.com/unicity-astrid/rfcs/pull/25)
 - Tracking Issue: [astrid#629](https://github.com/unicity-astrid/astrid/issues/629)
 
 # Summary
