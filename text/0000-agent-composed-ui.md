@@ -6,10 +6,10 @@
 # Summary
 [summary]: #summary
 
-Adopt Google's A2UI (Agent-to-User Interface) protocol as the rendering contract between capsules,
-the agent, and frontends. The agent owns the full layout composition — there are no predefined zones,
-slots, or hardcoded regions. Frontends are dumb renderers that draw whatever component tree the agent
-describes. Capsules provide components and data sources; the agent decides what goes where.
+Adopt Google's A2UI (Agent-to-User Interface) protocol as the rendering contract between the agent
+and frontends. The agent is a first-class bus participant — it observes IPC traffic, understands what
+data capsules are producing, and composes A2UI surfaces directly on the bus. Frontends are dumb
+renderers. Capsules don't change — their existing IPC events are the data sources.
 
 # Motivation
 [motivation]: #motivation
@@ -17,59 +17,35 @@ describes. Capsules provide components and data sources; the agent decides what 
 The frontend should not own structure or content. Content comes from capsules. Structure comes from
 the agent.
 
-The agent is uniquely positioned to compose UI because it understands:
-- What capsules are loaded and what components they offer
-- What the user is currently doing (coding, chatting, configuring, debugging)
-- What the user has asked for ("show me tools on the right", "minimal interface")
-- What information is relevant right now vs. noise
+The agent is uniquely positioned to compose UI because it:
+- Observes the IPC bus and sees what capsules are communicating
+- Understands what data is flowing and what's relevant to show
+- Knows what the user is doing and what they've asked for
+- Can adapt the layout to context without code changes
 
 By making the agent the UI composer:
 - **Adaptive layouts** — the agent reshapes the UI based on task context
 - **Natural language customization** — "put my config on the right" just works
-- **No hardcoded structure** — the default layout is just the agent's starting opinion
-- **Multi-frontend for free** — each frontend renders A2UI components natively; the agent's layout
-  description is frontend-agnostic
-- **Personality-driven defaults** — different agent identities can have different default layouts
-- **Theme as data** — colors and styling become data model patches the agent controls, adapting to
-  terminal capabilities rather than assuming a dark background
+- **No hardcoded structure** — the default layout is the agent's starting opinion
+- **Multi-frontend for free** — each frontend renders A2UI natively
+- **Personality-driven defaults** — different agent identities can have different layouts
+- **Theme as data** — colors and styling become data the agent controls
+- **Zero capsule changes** — existing IPC data structures are the data sources
 
 # Guide-level explanation
 [guide-level-explanation]: #guide-level-explanation
 
 ## For capsule developers
 
-Your capsule exports **components** — UI building blocks that the agent can place anywhere. You
-declare what you can provide; you do not decide where it goes.
+Nothing changes. Your capsule already publishes data on IPC topics with defined structures. The
+agent observes the bus, sees your data, and composes UI from it. You don't register UI components.
+You don't declare what you can provide. Your existing IPC events are the data sources.
 
-A component is registered via a `ui_describe` interceptor (same pattern as `tool_describe`):
+For example, the identity capsule already publishes spark config on `spark.v1.response.ready`. The
+react capsule already publishes model info and usage on `agent.v1.response`. The agent sees this
+traffic and can present it however it wants — as a status bar, a sidebar panel, a modal.
 
-```rust
-#[astrid::ui_component("model-status")]
-fn model_status() -> UiComponent {
-    UiComponent::new("model-status")
-        .catalog_type("Text")
-        .data_model(json!({
-            "model": "unknown",
-            "context_usage": 0.0
-        }))
-}
-```
-
-The agent discovers available components and composes them into a layout. Your capsule updates its
-data model via IPC — the component re-renders automatically through A2UI data binding:
-
-```rust
-sdk::publish("a2ui.data_model.update", json!({
-    "surfaceId": "root",
-    "patch": [
-        { "op": "replace", "path": "/model-status/model", "value": "gpt-5.4" },
-        { "op": "replace", "path": "/model-status/context_usage", "value": 0.47 }
-    ]
-}));
-```
-
-A capsule can offer multiple components of different shapes — a full config form, a compact status
-line, a detailed dashboard. Same data, different presentations. The agent picks what fits.
+If you want the agent to have richer data to display, publish richer IPC events. That's it.
 
 ## For users
 
@@ -101,91 +77,55 @@ Responsibilities:
 
 ## The agent's role
 
+The agent is a first-class participant on the IPC bus. It:
+
+1. **Observes** — subscribes to IPC topics and sees what data capsules produce
+2. **Composes** — publishes A2UI messages (`a2ui.*`) to describe the UI layout
+3. **Reacts** — restructures the UI based on bus traffic, user requests, or context changes
+
 The agent owns a single root A2UI surface that IS the entire screen. It composes the full component
-tree using A2UI layout primitives (`Row`, `Column`, `Card`, `Tabs`, `List`) and capsule-provided
-components.
+tree using A2UI layout primitives (`Row`, `Column`, `Card`, `Tabs`, `List`) and data from the bus.
 
-The LLM interacts with A2UI through **tools**, not IPC topics directly. A UI capsule exposes tools
-that the LLM calls; the capsule translates tool calls into A2UI IPC messages:
-
-```
-LLM calls `compose_ui` tool
-    → UI capsule receives tool call
-        → publishes A2UI messages to `a2ui.*` IPC topics
-            → frontend renders
-```
-
-On startup, the agent calls `compose_ui` with a default layout:
+On startup, the agent publishes a default layout:
 
 ```json
 {
-  "action": "update",
-  "components": [
-    { "id": "root", "component": "Column", "children": ["status", "main", "input"] },
-    { "id": "status", "component": "Row", "children": ["breadcrumb", "model-info"], "justify": "spaceBetween" },
-    { "id": "breadcrumb", "component": "Text", "text": "~ > dev > astrid", "variant": "caption" },
-    { "id": "model-info", "component": "Text", "text": "gpt-5.4 | 47%", "variant": "caption" },
-    { "id": "main", "component": "Column", "weight": 1, "children": ["messages"] },
-    { "id": "messages", "component": "List", "direction": "vertical", "children": [] },
-    { "id": "input", "component": "TextField", "placeholder": "Message..." }
-  ]
+  "updateComponents": {
+    "surfaceId": "root",
+    "components": [
+      { "id": "root", "component": "Column", "children": ["status", "main", "input"] },
+      { "id": "status", "component": "Row", "children": ["breadcrumb", "model-info"], "justify": "spaceBetween" },
+      { "id": "breadcrumb", "component": "Text", "text": "~ > dev > astrid", "variant": "caption" },
+      { "id": "model-info", "component": "Text", "text": "gpt-5.4 | 47%", "variant": "caption" },
+      { "id": "main", "component": "Column", "weight": 1, "children": ["messages"] },
+      { "id": "messages", "component": "List", "direction": "vertical", "children": [] },
+      { "id": "input", "component": "TextField", "placeholder": "Message..." }
+    ]
+  }
 }
 ```
 
 This is not special. It is not hardcoded. It is the agent's opening move. When the user asks for a
-sidebar, the agent calls `compose_ui` again with a restructured tree. No code change. No predefined
-zones. Just a different component tree.
+sidebar, the agent restructures the tree. No code change. No predefined zones. Just a different
+component tree.
+
+The agent can publish this default layout on boot without an LLM call — it's a static starting
+point. The LLM is consulted when the user requests layout changes, not for routine rendering.
 
 # Reference-level explanation
 [reference-level-explanation]: #reference-level-explanation
 
 ## Layers
 
-There are three layers:
+Two layers:
 
-1. **Tools** — the LLM's interface. The LLM calls tools like `compose_ui` to describe layouts.
-2. **IPC topics** (`a2ui.*`) — internal bus plumbing. A UI capsule translates tool calls into A2UI
-   IPC messages. Capsules also publish data model updates here directly.
-3. **A2UI protocol** — the wire format for messages on the bus. Frontends consume these.
+1. **IPC bus** (`a2ui.*` topics) — the agent publishes A2UI messages and observes capsule traffic
+   directly on the bus. The bus is the agent's native communication layer.
+2. **A2UI protocol** — the wire format for rendering messages. Frontends consume these.
 
-The LLM never publishes to IPC topics directly. It calls tools. A capsule bridges the gap.
-
-## Tools
-
-A UI capsule exposes tools for the LLM to compose and manage the interface:
-
-| Tool | Purpose |
-|------|---------|
-| `compose_ui` | Create or update the component tree on a surface |
-| `delete_surface` | Remove a surface |
-
-`compose_ui` input schema:
-
-```json
-{
-  "type": "object",
-  "properties": {
-    "action": {
-      "type": "string",
-      "enum": ["create", "update"],
-      "description": "Create a new surface or update an existing one"
-    },
-    "surface_id": {
-      "type": "string",
-      "description": "Surface identifier (default: 'root')"
-    },
-    "components": {
-      "type": "array",
-      "description": "A2UI component tree — flat list with id, component type, and children references",
-      "items": { "type": "object" }
-    }
-  },
-  "required": ["action", "components"]
-}
-```
-
-The UI capsule receives this tool call, wraps it in A2UI `createSurface`/`updateComponents`
-messages, and publishes to the `a2ui.*` IPC topics.
+The agent does not need tools to compose UI. It publishes to `a2ui.*` topics directly, just as any
+capsule publishes to its own topics. The LLM may influence layout decisions (via the react loop),
+but the agent capsule handles A2UI publishing as a bus participant.
 
 ## Protocol
 
@@ -230,13 +170,13 @@ Unsupported components degrade to `Text` or are omitted.
 
 ### IPC topics
 
-A2UI messages travel over the IPC event bus under `a2ui.*`:
+A2UI messages travel on the bus under `a2ui.*`:
 
 | IPC Topic | Payload | Direction |
 |-----------|---------|-----------|
 | `a2ui.surface.create` | A2UI `createSurface` | Agent → Frontend |
 | `a2ui.components.update` | A2UI `updateComponents` | Agent → Frontend |
-| `a2ui.data_model.update` | A2UI `updateDataModel` | Capsule/Agent → Frontend |
+| `a2ui.data_model.update` | A2UI `updateDataModel` | Agent → Frontend |
 | `a2ui.surface.delete` | A2UI `deleteSurface` | Agent → Frontend |
 | `a2ui.action` | `{ surfaceId, componentId, action, data }` | Frontend → Agent |
 | `a2ui.catalog.query` | `{}` | Agent → Frontend |
@@ -249,111 +189,66 @@ field in every payload (e.g., `"version": "v0.10"`). Topics are stable routing a
 spec version is a payload concern.
 
 When A2UI evolves, the frontend reads the `version` field and handles accordingly. No topic changes,
-no capsule manifest changes, no subscriber updates. This decouples IPC routing from spec evolution.
+no capsule manifest changes, no subscriber updates.
 
-### Component discovery
+### Data sources — the bus IS the component registry
 
-UI component discovery follows the same bus-based pattern as tool discovery:
+Capsules don't need to register UI components. Their existing IPC events are the data sources. The
+agent observes the bus and knows what data is available:
 
-1. Agent triggers `a2ui.request.describe` (hook fan-out to all capsules)
-2. Each capsule's `ui_describe` interceptor responds with its available components
-3. Agent collects the component registry
+| Existing IPC traffic | Data available | UI possibilities |
+|---------------------|----------------|------------------|
+| `spark.v1.response.ready` | Agent identity (callsign, class, tone) | Status badge, config panel |
+| `agent.v1.response` | Model name, response text, completion status | Status bar, chat stream |
+| `llm.v1.stream.*` | Token deltas, usage stats, tool calls | Progress bar, token counter |
+| `tool.v1.request.describe` | Tool schemas from all capsules | Tool list panel |
+| `registry.v1.active_model_changed` | Active model/provider switch | Model indicator |
+| `session.v1.response.get_messages` | Conversation history | Chat view |
 
-The `Capsule.toml` declares the interceptor and IPC capabilities:
-
-```toml
-[[interceptor]]
-event = "a2ui.request.describe"
-action = "ui_describe"
-
-[capabilities]
-ipc_publish = ["a2ui.response.describe.*"]
-```
-
-The `ui_describe` handler returns what the capsule can provide:
-
-```json
-{
-  "components": [
-    {
-      "id": "identity-config-form",
-      "display_name": "Identity Configuration",
-      "description": "Agent identity settings — callsign, class, tone, backstory",
-      "schema": {
-        "properties": {
-          "callsign": { "type": "string", "description": "Agent's display name" },
-          "class": { "type": "string", "description": "Agent class/role" },
-          "tone": { "type": "string", "description": "Communication style" }
-        }
-      },
-      "data_topic": "identity.v1.config",
-      "actions": ["save", "reset"]
-    },
-    {
-      "id": "identity-status",
-      "display_name": "Identity Status",
-      "description": "Current agent identity — compact name and class display",
-      "schema": {
-        "properties": {
-          "callsign": { "type": "string" },
-          "class": { "type": "string" }
-        }
-      },
-      "data_topic": "identity.v1.status"
-    }
-  ]
-}
-```
-
-The agent sees: "identity capsule has a config form and a status widget. Here are their schemas and
-data topics." The agent decides if, when, and where to place them.
-
-Two catalogs are in play:
-
-- **Frontend catalog** (A2UI standard): what primitive types the renderer supports (Row, Text, etc.)
-- **Capsule component registry** (bus-discovered): what data/interactions capsules provide
-
-The agent bridges the two — mapping capsule components onto A2UI primitives.
+The agent maps this data onto A2UI components. No new protocol for capsules. No `ui_describe`
+interceptor. Capsules keep doing exactly what they do today.
 
 ### Composition flow
 
-1. **Boot**: Frontend publishes `a2ui.catalog.response` with supported A2UI component types.
-2. **Discovery**: Agent triggers `a2ui.request.describe` — capsules respond with available
-   components.
-3. **Compose**: Agent calls `compose_ui` tool with the default layout. The UI capsule publishes
-   the A2UI messages to the bus.
-4. **Interact**: On user input ("show tools sidebar"), agent calls `compose_ui` again with a
-   restructured tree.
-5. **Live data**: Capsules publish `a2ui.data_model.update` directly to push values to their
-   components. Frontend re-renders via A2UI data binding. (This is the one case where capsules
-   publish to `a2ui.*` topics directly — data updates, not layout changes.)
-6. **Persist**: Agent saves layout composition to session state. On reconnect, restores last layout.
+1. **Boot**: Agent publishes a default A2UI layout on the bus. No LLM call needed — this is a
+   static default the agent capsule emits on load.
+2. **Observe**: Agent subscribes to relevant IPC topics and sees capsule data flowing.
+3. **Update**: Agent publishes `a2ui.data_model.update` as bus data changes (e.g., model name
+   changes, context usage updates).
+4. **Interact**: When the user requests a layout change, the LLM is consulted (via the react
+   loop). The react loop's response includes A2UI updates that the agent publishes.
+5. **Persist**: Layout composition saved to KV. On reconnect, restored without LLM involvement.
 
 ### Error handling
 
 - **Unknown component type**: Frontend renders as `Text` with the component's `id`, or omits.
   Agent sees `a2ui.error` and can adapt.
 - **Invalid tree structure**: Rejected with `a2ui.error`; last valid tree retained.
-- **Agent not ready**: Frontend renders a minimal loading state until the first `createSurface`
-  arrives. This is the only hardcoded UI in the frontend.
 
 ### Capability gating
 
 Surface creation and component updates are capability-gated. Only the orchestrating agent (or
-capsules with `ui.surface.write` capability) can emit `createSurface` and `updateComponents`.
-Any capsule can emit `updateDataModel` for components it owns (scoped by component ID prefix
-matching its capsule namespace).
+capsules with `a2ui.surface.write` capability) can emit `createSurface` and `updateComponents`.
 
-This prevents a rogue capsule from hijacking the layout while allowing capsules to update their data.
+This prevents a rogue capsule from hijacking the layout.
+
+## Multi-principal surfaces
+
+Each principal (`home/agent1`, `home/agent2`) gets its own capsule instances, bus subscriptions, and
+A2UI surfaces. The agent for each principal composes its own UI independently.
+
+This means multiple agents can coexist in the same runtime, each with their own layout and data
+sources. A2A (Agent-to-Agent) communication between principals is native IPC on the same bus —
+agents can observe each other's traffic and coordinate.
+
+A principal's A2UI surface is scoped to its own frontend connections. `home/agent1`'s UI doesn't
+bleed into `home/agent2`'s frontend.
 
 # Drawbacks
 [drawbacks]: #drawbacks
 
-- **Agent latency on boot**: First render depends on the agent composing a layout. Mitigation: cache
-  the last layout and restore it immediately; the agent updates once ready.
-
-- **LLM token cost**: Component registry, layout state, and A2UI grammar consume context window
-  tokens. For simple chat, this is overhead.
+- **LLM token cost**: When layout changes are requested, the A2UI grammar and current layout state
+  consume context window tokens.
 
 - **Layout instability**: A poorly prompted agent could produce jarring layout changes. Mitigation:
   system prompt instructs conservative layout behavior; changes only on explicit user request.
@@ -369,8 +264,8 @@ This prevents a rogue capsule from hijacking the layout while allowing capsules 
 ## Why A2UI?
 
 A2UI solves the component description problem with a well-designed catalog, surface lifecycle, data
-binding, and security model. Building a custom protocol would duplicate this work. A2UI is
-Apache 2.0, open-source, and has ecosystem adoption.
+binding, and security model. Building a custom protocol would duplicate this. A2UI is Apache 2.0
+and has ecosystem adoption.
 
 ## Why not MCP Apps?
 
@@ -382,28 +277,35 @@ A2UI's declarative approach maps to any native widget toolkit.
 Zones impose structure the agent should own. The agent CAN create a zone-like layout if it chooses,
 but is not constrained to one. Structure is an agent choice, not a system constraint.
 
-## What if the agent produces bad layouts?
+## Why bus-native instead of tools?
 
-The frontend validates component trees. Invalid structures are rejected; the last valid tree is
-retained. Users can always say "reset to default."
+Tools are an abstraction over the bus for LLM interaction. But UI composition is not purely an LLM
+concern — the agent publishes a default layout on boot (no LLM), updates data bindings as bus
+traffic flows (no LLM), and only consults the LLM for user-requested layout changes. Making the
+agent a direct bus participant avoids forcing every UI update through the tool call → LLM → response
+cycle.
+
+## Why no component registration?
+
+Capsules already publish structured data on IPC topics. The agent observes the bus and knows what
+data exists. Adding a separate UI component registration protocol would duplicate what the bus
+already provides and require every capsule to implement a new interceptor for no gain.
 
 # Prior art
 [prior-art]: #prior-art
 
 - **A2UI (Google)** — The protocol we adopt. Declarative JSON component descriptions, catalog-based
-  security, surface lifecycle. Apache 2.0. Our contribution is the agent-as-composer pattern.
+  security, surface lifecycle. Apache 2.0. Our contribution is the agent-as-bus-participant
+  composition model.
 
-- **MCP Apps (Anthropic + OpenAI)** — HTML/JS in sandboxed iframes. Richer rendering but requires a
-  web runtime. Not viable for terminals.
+- **MCP Apps (Anthropic + OpenAI)** — HTML/JS in sandboxed iframes. Not viable for terminals.
 
-- **AG-UI (CopilotKit)** — Event-based agent-frontend streaming protocol. Complementary to A2UI
-  (transport layer vs. component format). Worth evaluating for IPC transport in future work.
+- **AG-UI (CopilotKit)** — Event-based agent-frontend streaming protocol. Complementary to A2UI.
 
-- **Zellij / tmux** — Terminal multiplexers with user-composed panes. Same concept but manual. This
-  RFC is the AI-native version of terminal pane composition.
+- **Zellij / tmux** — Terminal multiplexers with user-composed panes. Same concept but manual.
 
-- **Emacs** — Editor as a Lisp-driven UI canvas. Windows, buffers, and frames composed
-  programmatically. Philosophically similar, with the agent replacing Emacs Lisp.
+- **Emacs** — Editor as a Lisp-driven UI canvas. Philosophically similar, with the agent replacing
+  Emacs Lisp as the composition layer.
 
 # Unresolved questions
 [unresolved-questions]: #unresolved-questions
@@ -414,22 +316,27 @@ retained. Users can always say "reset to default."
 - **Focus management**: When the agent restructures the layout, where does keyboard focus go?
   A2UI lacks a focus primitive. May need a convention (e.g., `focused: true` property).
 
-- **Layout persistence**: How is the last-known layout serialized? Raw A2UI component list or a
-  higher-level representation?
+- **Layout persistence**: How is the last-known layout serialized for session restore? What
+  survives session clear vs. daemon restart?
 
 - **Chat message rendering**: Is the message stream a `List` of A2UI `Text` components, or a
-  special-cased renderer? Full A2UI enables richer messages but adds complexity.
+  special-cased renderer?
 
-- **Input handling**: How do A2UI actions map to the IPC event system? Is a keystroke in a
-  `TextField` an A2UI action or an IPC event?
+- **Input handling**: How do A2UI actions map to the IPC event system?
 
 - **Performance**: How many components can ratatui render at 60fps? Large trees may need
   virtualization.
+
+- **Multi-principal surface routing**: How does the frontend/proxy know which principal's A2UI
+  surface to render for a given connection?
 
 # Future possibilities
 [future-possibilities]: #future-possibilities
 
 - **Saveable layouts**: Named layouts ("coding", "debugging", "minimal") the user switches between.
+
+- **A2A-driven UI**: Agent1 observes Agent2's bus traffic and composes a dashboard of Agent2's
+  activity. Multi-agent monitoring via the same A2UI surface.
 
 - **Layout marketplace**: Capsule authors publish recommended layouts alongside their capsules.
 
@@ -437,9 +344,7 @@ retained. Users can always say "reset to default."
 
 - **Sixel/Kitty graphics**: Terminals with image protocol support render `Image` components inline.
 
-- **Web frontend**: A2UI components rendered as React/HTML. Same layout description, richer output.
-
-- **Collaborative UI**: Multiple users in one session see the same agent-composed layout.
+- **Web frontend**: A2UI components rendered as React/HTML. Same layout, richer output.
 
 - **Theme as data model**: Colors and styling as data model patches. Dark/light/high-contrast
   become agent-controlled, adapting to terminal capabilities.
