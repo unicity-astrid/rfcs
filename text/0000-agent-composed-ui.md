@@ -87,9 +87,64 @@ handles the data plumbing.
 The agent owns a single root A2UI surface that IS the entire screen. It composes the full component
 tree using A2UI layout primitives (`Row`, `Column`, `Card`, `Tabs`, `List`) with IPC event bindings.
 
-On startup, the agent publishes a default layout. Components bind directly to IPC events — not
-to an intermediate data model the agent manually patches. The agent describes **structure and
-bindings**. The runtime wires IPC events to components automatically:
+On startup, the agent publishes a default layout. Components bind directly to IPC event fields.
+The agent describes **structure and bindings**. The runtime wires IPC events to components.
+
+### How IPC messages look on the wire
+
+Every IPC message has an envelope with `topic` and `payload`. The `payload` is an `IpcPayload` —
+a tagged enum. Capsule-published data arrives as the `Custom` variant with the data nested under
+`data`. Typed kernel payloads (like `AgentResponse`) have fields at the top level of `payload`.
+
+For example, when the registry capsule publishes the active model, the message on the wire is:
+
+```json
+{
+  "topic": "registry.v1.active_model_changed",
+  "payload": {
+    "type": "custom",
+    "data": {
+      "id": "gpt-5.4",
+      "description": "OpenAI GPT-5.4 (gpt-5.4)",
+      "request_topic": "llm.v1.request.generate.openai",
+      "stream_topic": "llm.v1.stream.openai",
+      "capabilities": ["text", "tools", "vision"],
+      "context_window": 1050000,
+      "max_output_tokens": 128000
+    }
+  },
+  "source_id": "...",
+  "timestamp": "..."
+}
+```
+
+And when the react capsule publishes a response, it looks like:
+
+```json
+{
+  "topic": "agent.v1.response",
+  "payload": {
+    "type": "agent_response",
+    "text": "Hello! How can I help?",
+    "is_final": true,
+    "session_id": "abc-123"
+  }
+}
+```
+
+### Binding syntax
+
+A binding references an IPC topic and a JSON Pointer path into the message. The path is relative
+to the full message object:
+
+```json
+{ "topic": "<ipc topic>", "path": "<json pointer into the message>" }
+```
+
+For Custom payloads (capsule-published), the data is at `/payload/data/<field>`.
+For typed payloads (kernel-originated), the fields are at `/payload/<field>`.
+
+### Default layout with bindings
 
 ```json
 {
@@ -97,10 +152,23 @@ bindings**. The runtime wires IPC events to components automatically:
     "surfaceId": "root",
     "components": [
       { "id": "root", "component": "Column", "children": ["status", "main", "input"] },
-      { "id": "status", "component": "Row", "children": ["breadcrumb", "model-info", "context-bar"], "justify": "spaceBetween" },
-      { "id": "breadcrumb", "component": "Text", "text": {"topic": "workspace.v1.path", "path": "/display_path"}, "variant": "caption" },
-      { "id": "model-info", "component": "Text", "text": {"topic": "registry.v1.active_model_changed", "path": "/model_id"}, "variant": "caption" },
-      { "id": "context-bar", "component": "ProgressBar", "value": {"topic": "llm.v1.stream.*", "path": "/event/usage/ratio"} },
+      {
+        "id": "status",
+        "component": "Row",
+        "children": ["model-info", "context-bar"],
+        "justify": "spaceBetween"
+      },
+      {
+        "id": "model-info",
+        "component": "Text",
+        "text": { "topic": "registry.v1.active_model_changed", "path": "/payload/data/id" },
+        "variant": "caption"
+      },
+      {
+        "id": "context-bar",
+        "component": "ProgressBar",
+        "value": { "topic": "llm.v1.stream.openai", "path": "/payload/event/Usage/input_tokens" }
+      },
       { "id": "main", "component": "Column", "weight": 1, "children": ["messages"] },
       { "id": "messages", "component": "List", "direction": "vertical", "children": [] },
       { "id": "input", "component": "TextField", "placeholder": "Message..." }
@@ -109,11 +177,33 @@ bindings**. The runtime wires IPC events to components automatically:
 }
 ```
 
-When `registry.v1.active_model_changed` fires on the IPC bus, the runtime extracts `/model_id`
-from the event payload and updates the `model-info` component. No agent involvement. No data model
-patches. The binding IS the wiring — IPC events flow directly to components.
+### End-to-end flow: model name update
 
-The agent describes structure and bindings (what goes where, what IPC data drives it). The runtime
+1. User runs `/model gpt-5.4-mini` in the CLI.
+2. Registry capsule handles the command, sets the active model.
+3. Registry calls `ipc::publish_json("registry.v1.active_model_changed", &provider_entry)`.
+4. The kernel wraps this as `IpcMessage { topic, payload: Custom { data: ProviderEntry } }` and
+   publishes on the event bus.
+5. The runtime sees that `model-info` has a binding to topic `registry.v1.active_model_changed`
+   at path `/payload/data/id`.
+6. The runtime extracts `"gpt-5.4-mini"` from the message at that JSON pointer path.
+7. The runtime updates the `model-info` component's `text` property to `"gpt-5.4-mini"`.
+8. The frontend re-renders the component.
+
+No LLM call. No agent involvement. No layout change. The IPC event flows through the binding to
+the component automatically.
+
+### End-to-end flow: layout change
+
+1. User types "show me a sidebar with loaded tools".
+2. React loop processes the prompt → LLM generates a response.
+3. The LLM's response includes a layout restructure — it publishes an `updateComponents` that
+   replaces `main` with a `Row` containing the chat column and a new tools sidebar, with the
+   sidebar's table bound to `tool.v1.request.describe` at `/payload/data/tools`.
+4. The frontend receives the new component tree and re-renders.
+5. Tool data flows through the new binding automatically.
+
+The LLM describes structure and bindings (what goes where, what IPC data drives it). The runtime
 handles the plumbing. Layout changes require the LLM. Data updates are automatic.
 
 The agent can publish this default layout on boot without an LLM call — it's a static starting
@@ -202,19 +292,19 @@ no capsule manifest changes, no subscriber updates.
 ### Data sources — IPC event bindings
 
 Capsules don't register UI components. Their existing IPC events are the data sources. Components
-bind directly to IPC topics and extract values via JSON path:
+bind directly to IPC topics and extract fields via JSON Pointer paths into the message:
 
-| Binding target | IPC topic | Payload path | Component |
-|---------------|-----------|-------------|-----------|
-| Active model | `registry.v1.active_model_changed` | `/model_id` | `Text` |
-| Context usage | `llm.v1.stream.*` | `/event/usage/ratio` | `ProgressBar` |
-| Agent name | `spark.v1.response.ready` | `/callsign` | `Badge` |
-| Conversation | `session.v1.response.get_messages` | `/messages` | `List` |
-| Tool list | `tool.v1.request.describe` | `/tools` | `Table` |
+| IPC topic | Payload type | Pointer path | Extracted value |
+|-----------|-------------|-------------|-----------------|
+| `registry.v1.active_model_changed` | `Custom` | `/payload/data/id` | `"gpt-5.4"` |
+| `registry.v1.active_model_changed` | `Custom` | `/payload/data/context_window` | `1050000` |
+| `llm.v1.stream.*` | `LlmStreamEvent` | `/payload/event/Usage/input_tokens` | `4521` |
+| `spark.v1.response.ready` | `Custom` | `/payload/data/callsign` | `"Nova"` |
+| `agent.v1.response` | `AgentResponse` | `/payload/text` | `"Hello!"` |
 
-The runtime subscribes to the referenced topics and routes payload values to bound components.
-Components never contain hardcoded values — they contain bindings to IPC event structure. Capsules
-keep doing exactly what they do today.
+The runtime subscribes to the referenced topics and routes extracted values to bound components.
+Components never contain hardcoded values — they contain bindings to IPC event structure.
+Capsules keep doing exactly what they do today.
 
 ### Composition flow
 
