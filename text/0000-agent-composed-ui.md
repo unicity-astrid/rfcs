@@ -105,44 +105,91 @@ The agent owns a single root A2UI surface that IS the entire screen. It composes
 tree using A2UI layout primitives (`Row`, `Column`, `Card`, `Tabs`, `List`) and capsule-provided
 components.
 
-On startup, the agent emits a default layout:
+The LLM interacts with A2UI through **tools**, not IPC topics directly. A UI capsule exposes tools
+that the LLM calls; the capsule translates tool calls into A2UI IPC messages:
 
-```json
-{
-  "createSurface": {
-    "surfaceId": "root",
-    "catalogId": "astrid/cli/v1"
-  }
-}
+```
+LLM calls `compose_ui` tool
+    → UI capsule receives tool call
+        → publishes A2UI messages to `a2ui.*` IPC topics
+            → frontend renders
 ```
 
+On startup, the agent calls `compose_ui` with a default layout:
+
 ```json
 {
-  "updateComponents": {
-    "surfaceId": "root",
-    "components": [
-      { "id": "root", "component": "Column", "children": ["status", "main", "input"] },
-      { "id": "status", "component": "Row", "children": ["breadcrumb", "model-info"], "justify": "spaceBetween" },
-      { "id": "breadcrumb", "component": "Text", "text": "~ > dev > astrid", "variant": "caption" },
-      { "id": "model-info", "component": "Text", "text": "gpt-5.4 | 47%", "variant": "caption" },
-      { "id": "main", "component": "Column", "weight": 1, "children": ["messages"] },
-      { "id": "messages", "component": "List", "direction": "vertical", "children": [] },
-      { "id": "input", "component": "TextField", "placeholder": "Message..." }
-    ]
-  }
+  "action": "update",
+  "components": [
+    { "id": "root", "component": "Column", "children": ["status", "main", "input"] },
+    { "id": "status", "component": "Row", "children": ["breadcrumb", "model-info"], "justify": "spaceBetween" },
+    { "id": "breadcrumb", "component": "Text", "text": "~ > dev > astrid", "variant": "caption" },
+    { "id": "model-info", "component": "Text", "text": "gpt-5.4 | 47%", "variant": "caption" },
+    { "id": "main", "component": "Column", "weight": 1, "children": ["messages"] },
+    { "id": "messages", "component": "List", "direction": "vertical", "children": [] },
+    { "id": "input", "component": "TextField", "placeholder": "Message..." }
+  ]
 }
 ```
 
 This is not special. It is not hardcoded. It is the agent's opening move. When the user asks for a
-sidebar, the agent restructures the tree — replacing `main` with a `Row` containing the chat column
-and a new sidebar column. No code change. No predefined zones. Just a different component tree.
+sidebar, the agent calls `compose_ui` again with a restructured tree. No code change. No predefined
+zones. Just a different component tree.
 
 # Reference-level explanation
 [reference-level-explanation]: #reference-level-explanation
 
+## Layers
+
+There are three layers:
+
+1. **Tools** — the LLM's interface. The LLM calls tools like `compose_ui` to describe layouts.
+2. **IPC topics** (`a2ui.*`) — internal bus plumbing. A UI capsule translates tool calls into A2UI
+   IPC messages. Capsules also publish data model updates here directly.
+3. **A2UI protocol** — the wire format for messages on the bus. Frontends consume these.
+
+The LLM never publishes to IPC topics directly. It calls tools. A capsule bridges the gap.
+
+## Tools
+
+A UI capsule exposes tools for the LLM to compose and manage the interface:
+
+| Tool | Purpose |
+|------|---------|
+| `compose_ui` | Create or update the component tree on a surface |
+| `delete_surface` | Remove a surface |
+
+`compose_ui` input schema:
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "action": {
+      "type": "string",
+      "enum": ["create", "update"],
+      "description": "Create a new surface or update an existing one"
+    },
+    "surface_id": {
+      "type": "string",
+      "description": "Surface identifier (default: 'root')"
+    },
+    "components": {
+      "type": "array",
+      "description": "A2UI component tree — flat list with id, component type, and children references",
+      "items": { "type": "object" }
+    }
+  },
+  "required": ["action", "components"]
+}
+```
+
+The UI capsule receives this tool call, wraps it in A2UI `createSurface`/`updateComponents`
+messages, and publishes to the `a2ui.*` IPC topics.
+
 ## Protocol
 
-Adopt A2UI (latest stable at implementation time) as the wire protocol. No modifications to the
+Adopt A2UI (latest stable at implementation time) as the wire format. No modifications to the
 core spec.
 
 ### Message types (A2UI standard)
@@ -273,11 +320,13 @@ The agent bridges the two — mapping capsule components onto A2UI primitives.
 1. **Boot**: Frontend publishes `a2ui.catalog.response` with supported A2UI component types.
 2. **Discovery**: Agent triggers `a2ui.request.describe` — capsules respond with available
    components.
-3. **Compose**: Agent emits `createSurface` + `updateComponents` with the default layout.
-4. **Interact**: On user input ("show tools sidebar"), agent emits `updateComponents` with a
+3. **Compose**: Agent calls `compose_ui` tool with the default layout. The UI capsule publishes
+   the A2UI messages to the bus.
+4. **Interact**: On user input ("show tools sidebar"), agent calls `compose_ui` again with a
    restructured tree.
-5. **Live data**: Capsules publish `a2ui.data_model.update` to push values to their components.
-   Frontend re-renders via A2UI data binding.
+5. **Live data**: Capsules publish `a2ui.data_model.update` directly to push values to their
+   components. Frontend re-renders via A2UI data binding. (This is the one case where capsules
+   publish to `a2ui.*` topics directly — data updates, not layout changes.)
 6. **Persist**: Agent saves layout composition to session state. On reconnect, restores last layout.
 
 ### Error handling
