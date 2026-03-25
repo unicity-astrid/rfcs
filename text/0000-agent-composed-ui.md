@@ -77,16 +77,19 @@ Responsibilities:
 
 ## The agent's role
 
-The agent is a first-class participant on the IPC bus. It:
+The agent publishes A2UI layout descriptions on the bus. It describes **structure and bindings** —
+which components exist, how they're arranged, and which IPC events drive their values. The runtime
+handles the data plumbing.
 
-1. **Observes** — subscribes to IPC topics and sees what data capsules produce
-2. **Composes** — publishes A2UI messages (`a2ui.*`) to describe the UI layout
-3. **Reacts** — restructures the UI based on bus traffic, user requests, or context changes
+1. **Composes** — publishes A2UI messages (`a2ui.*`) describing layout and IPC bindings
+2. **Restructures** — when the user requests changes, the LLM produces new structure + bindings
 
 The agent owns a single root A2UI surface that IS the entire screen. It composes the full component
-tree using A2UI layout primitives (`Row`, `Column`, `Card`, `Tabs`, `List`) and data from the bus.
+tree using A2UI layout primitives (`Row`, `Column`, `Card`, `Tabs`, `List`) with IPC event bindings.
 
-On startup, the agent publishes a default layout:
+On startup, the agent publishes a default layout. Components bind directly to IPC events — not
+to an intermediate data model the agent manually patches. The agent describes **structure and
+bindings**. The runtime wires IPC events to components automatically:
 
 ```json
 {
@@ -94,9 +97,10 @@ On startup, the agent publishes a default layout:
     "surfaceId": "root",
     "components": [
       { "id": "root", "component": "Column", "children": ["status", "main", "input"] },
-      { "id": "status", "component": "Row", "children": ["breadcrumb", "model-info"], "justify": "spaceBetween" },
-      { "id": "breadcrumb", "component": "Text", "text": "~ > dev > astrid", "variant": "caption" },
-      { "id": "model-info", "component": "Text", "text": "gpt-5.4 | 47%", "variant": "caption" },
+      { "id": "status", "component": "Row", "children": ["breadcrumb", "model-info", "context-bar"], "justify": "spaceBetween" },
+      { "id": "breadcrumb", "component": "Text", "text": {"topic": "workspace.v1.path", "path": "/display_path"}, "variant": "caption" },
+      { "id": "model-info", "component": "Text", "text": {"topic": "registry.v1.active_model_changed", "path": "/model_id"}, "variant": "caption" },
+      { "id": "context-bar", "component": "ProgressBar", "value": {"topic": "llm.v1.stream.*", "path": "/event/usage/ratio"} },
       { "id": "main", "component": "Column", "weight": 1, "children": ["messages"] },
       { "id": "messages", "component": "List", "direction": "vertical", "children": [] },
       { "id": "input", "component": "TextField", "placeholder": "Message..." }
@@ -105,9 +109,12 @@ On startup, the agent publishes a default layout:
 }
 ```
 
-This is not special. It is not hardcoded. It is the agent's opening move. When the user asks for a
-sidebar, the agent restructures the tree. No code change. No predefined zones. Just a different
-component tree.
+When `registry.v1.active_model_changed` fires on the IPC bus, the runtime extracts `/model_id`
+from the event payload and updates the `model-info` component. No agent involvement. No data model
+patches. The binding IS the wiring — IPC events flow directly to components.
+
+The agent describes structure and bindings (what goes where, what IPC data drives it). The runtime
+handles the plumbing. Layout changes require the LLM. Data updates are automatic.
 
 The agent can publish this default layout on boot without an LLM call — it's a static starting
 point. The LLM is consulted when the user requests layout changes, not for routine rendering.
@@ -119,13 +126,14 @@ point. The LLM is consulted when the user requests layout changes, not for routi
 
 Two layers:
 
-1. **IPC bus** (`a2ui.*` topics) — the agent publishes A2UI messages and observes capsule traffic
-   directly on the bus. The bus is the agent's native communication layer.
+1. **IPC bus** (`a2ui.*` topics) — the agent publishes A2UI layout descriptions. Components bind
+   directly to other IPC topics via `{topic, path}` references. The runtime wires events to
+   components automatically.
 2. **A2UI protocol** — the wire format for rendering messages. Frontends consume these.
 
-The agent does not need tools to compose UI. It publishes to `a2ui.*` topics directly, just as any
-capsule publishes to its own topics. The LLM may influence layout decisions (via the react loop),
-but the agent capsule handles A2UI publishing as a bus participant.
+The agent publishes to `a2ui.*` topics directly, just as any capsule publishes to its own topics.
+The LLM may influence layout decisions (via the react loop), but routine data updates flow from
+IPC events to components through bindings without agent involvement.
 
 ## Protocol
 
@@ -191,33 +199,33 @@ spec version is a payload concern.
 When A2UI evolves, the frontend reads the `version` field and handles accordingly. No topic changes,
 no capsule manifest changes, no subscriber updates.
 
-### Data sources — the bus IS the component registry
+### Data sources — IPC event bindings
 
-Capsules don't need to register UI components. Their existing IPC events are the data sources. The
-agent observes the bus and knows what data is available:
+Capsules don't register UI components. Their existing IPC events are the data sources. Components
+bind directly to IPC topics and extract values via JSON path:
 
-| Existing IPC traffic | Data available | UI possibilities |
-|---------------------|----------------|------------------|
-| `spark.v1.response.ready` | Agent identity (callsign, class, tone) | Status badge, config panel |
-| `agent.v1.response` | Model name, response text, completion status | Status bar, chat stream |
-| `llm.v1.stream.*` | Token deltas, usage stats, tool calls | Progress bar, token counter |
-| `tool.v1.request.describe` | Tool schemas from all capsules | Tool list panel |
-| `registry.v1.active_model_changed` | Active model/provider switch | Model indicator |
-| `session.v1.response.get_messages` | Conversation history | Chat view |
+| Binding target | IPC topic | Payload path | Component |
+|---------------|-----------|-------------|-----------|
+| Active model | `registry.v1.active_model_changed` | `/model_id` | `Text` |
+| Context usage | `llm.v1.stream.*` | `/event/usage/ratio` | `ProgressBar` |
+| Agent name | `spark.v1.response.ready` | `/callsign` | `Badge` |
+| Conversation | `session.v1.response.get_messages` | `/messages` | `List` |
+| Tool list | `tool.v1.request.describe` | `/tools` | `Table` |
 
-The agent maps this data onto A2UI components. No new protocol for capsules. No `ui_describe`
-interceptor. Capsules keep doing exactly what they do today.
+The runtime subscribes to the referenced topics and routes payload values to bound components.
+Components never contain hardcoded values — they contain bindings to IPC event structure. Capsules
+keep doing exactly what they do today.
 
 ### Composition flow
 
-1. **Boot**: Agent publishes a default A2UI layout on the bus. No LLM call needed — this is a
-   static default the agent capsule emits on load.
-2. **Observe**: Agent subscribes to relevant IPC topics and sees capsule data flowing.
-3. **Update**: Agent publishes `a2ui.data_model.update` as bus data changes (e.g., model name
-   changes, context usage updates).
-4. **Interact**: When the user requests a layout change, the LLM is consulted (via the react
-   loop). The react loop's response includes A2UI updates that the agent publishes.
-5. **Persist**: Layout composition saved to KV. On reconnect, restored without LLM involvement.
+1. **Boot**: Agent publishes a default A2UI layout with IPC bindings. No LLM call needed — this
+   is a static default the agent capsule emits on load.
+2. **Wire**: The runtime subscribes to all topics referenced in bindings. As IPC events fire,
+   values flow to bound components automatically. No agent involvement.
+3. **Interact**: When the user requests a layout change, the LLM is consulted (via the react
+   loop). The LLM describes new structure and bindings — not values.
+4. **Persist**: Layout composition (structure + bindings) saved to KV. On reconnect, restored
+   without LLM involvement. Bindings re-activate as bus traffic resumes.
 
 ### Error handling
 
