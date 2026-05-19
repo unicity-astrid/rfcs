@@ -6,7 +6,7 @@
 # Summary
 [summary]: #summary
 
-Add a single outbound TCP host function — `astrid:capsule/net.net-connect-tcp(host, port) -> stream-handle` — capability-gated against a per-capsule `net_connect` allowlist in `Capsule.toml`. Reuses the existing stream-handle plumbing (`net-read` / `net-write` / `net-close-stream` already in production for the Unix accept path), the existing SSRF airlock (`is_safe_ip`) already used by `http-request`, and the existing per-capsule active-streams cap. The SDKs expose a `std::net::TcpStream`-shaped facade on top — capsule authors write `astrid_sdk::net::TcpStream::connect("host:port")` and get `Read + Write` for free; the JS SDK exposes the same primitive as `astrid.net.connect(host, port)` with `AsyncIterable<Uint8Array>` ergonomics. WebSocket and every higher protocol stays in user-space; the host gives capsules the same primitive `std::net::TcpStream` gives a Rust binary, no more.
+Add the full `std::net::TcpStream` surface to the `astrid:capsule/net` host ABI: `net-connect-tcp(host, port) -> stream-handle` plus the 14 socket operations a Rust binary expects on a connected TCP stream — byte-stream `net-read-bytes` / `net-write-bytes` (no length-prefix framing, distinct from the existing framed `net-read` / `net-write` used by the inbound Unix-accept proxy), `net-peek`, `net-shutdown(read|write|both)` half-close, `net-peer-addr` / `net-local-addr`, `net-set-nodelay` / `net-nodelay`, `net-set-read-timeout` / `net-read-timeout`, `net-set-write-timeout` / `net-write-timeout`, `net-set-ttl` / `net-ttl`. Capability-gated against a per-capsule `net_connect` allowlist in `Capsule.toml`; SSRF airlock from `http-request` runs on the resolved IP. The SDKs expose a `TcpStream` facade with `std::io::Read + Write + Drop` and matching std-style methods (`set_nodelay`, `peer_addr`, `shutdown(Shutdown::Write)`, …); the JS SDK adds the same methods to the `StreamHandle` class. Generic code over `Read + Write` (`tungstenite` for WebSocket, `rustls`, postgres drivers) works unmodified. WebSocket and every higher protocol stay in user-space — the host gives capsules the same primitive `std::net::TcpStream` gives a Rust binary, no more.
 
 # Motivation
 [motivation]: #motivation
@@ -126,37 +126,73 @@ This mirrors the airlock already running on `http-request`. The capability check
 
 ## WIT change
 
-Add one function to the canonical `astrid:capsule/net` interface (`host/astrid-capsule.wit` in `unicity-astrid/wit`):
+Add one enum (`shutdown-how`) to the `types` interface and 15 functions to the `net` interface in canonical `host/astrid-capsule.wit`:
 
 ```wit
+interface types {
+    // ... existing records / variants ...
+
+    /// Direction argument for `net-shutdown` — mirrors `std::net::Shutdown`.
+    enum shutdown-how {
+        read,    // half-close the read side
+        write,   // half-close the write side
+        both,    // close both directions
+    }
+}
+
 interface net {
-    use types.{net-read-status};
+    use types.{net-read-status, shutdown-how};
 
-    // ... existing fns: net-bind-unix, net-accept, net-poll-accept, ...
+    // ... existing inbound fns: net-bind-unix, net-accept, net-poll-accept,
+    //     net-read (framed), net-write (framed), net-close-stream ...
 
-    /// Open an outbound TCP connection to `host:port`.
-    ///
-    /// Returns a stream handle compatible with `net-read` / `net-write` /
-    /// `net-close-stream` — the same handle type returned by `net-accept`.
-    ///
-    /// Security:
-    /// - The capsule's `net_connect` capability allowlist must contain a
-    ///   pattern matching `host:port` (exact or trailing-wildcard segment).
-    /// - DNS resolution runs after the capability check. The resolved IP
-    ///   is checked against the same SSRF airlock that gates `http-request`
-    ///   (loopback / private / link-local / multicast / unspecified all
-    ///   rejected).
-    /// - The capsule's per-instance active-stream cap (default 8) is
-    ///   enforced; exceeding it returns an error rather than closing an
-    ///   existing stream.
-    /// - Connect timeout is bounded (default 10s); a stalled DNS or TCP
-    ///   handshake returns an error rather than holding the WASM guest
-    ///   in a host fn indefinitely.
+    /// Open an outbound TCP connection to `host:port`. Capability-gated
+    /// against the manifest `net_connect` allowlist; resolved IP checked
+    /// against the `http-request` SSRF airlock; per-capsule
+    /// active-stream cap shared with `net-accept`; bounded 10s connect
+    /// timeout.
     net-connect-tcp: func(host: string, port: u16) -> result<u64, string>;
+
+    // ── std::net::TcpStream parity ──────────────────────────────────────
+
+    /// Read up to `max-bytes` without length-prefix framing.
+    /// `std::io::Read::read` equivalent. Empty result = EOF. Honours
+    /// the read timeout if previously set.
+    net-read-bytes: func(stream-handle: u64, max-bytes: u32) -> result<list<u8>, string>;
+
+    /// Write `data` without framing. Returns bytes-written (may be
+    /// less than `data.len()`). Honours the write timeout.
+    net-write-bytes: func(stream-handle: u64, data: list<u8>) -> result<u32, string>;
+
+    /// Peek up to `max-bytes` without consuming them.
+    net-peek: func(stream-handle: u64, max-bytes: u32) -> result<list<u8>, string>;
+
+    /// Half-close the read side, write side, or both.
+    net-shutdown: func(stream-handle: u64, how: shutdown-how) -> result<_, string>;
+
+    /// Remote peer / local socket address as `"ip:port"`.
+    net-peer-addr:  func(stream-handle: u64) -> result<string, string>;
+    net-local-addr: func(stream-handle: u64) -> result<string, string>;
+
+    /// TCP_NODELAY (Nagle off when true). TCP-only.
+    net-set-nodelay: func(stream-handle: u64, nodelay: bool) -> result<_, string>;
+    net-nodelay:     func(stream-handle: u64) -> result<bool, string>;
+
+    /// Read / write timeouts (milliseconds). `none` clears the timeout.
+    net-set-read-timeout:  func(stream-handle: u64, timeout-ms: option<u64>) -> result<_, string>;
+    net-read-timeout:      func(stream-handle: u64) -> result<option<u64>, string>;
+    net-set-write-timeout: func(stream-handle: u64, timeout-ms: option<u64>) -> result<_, string>;
+    net-write-timeout:     func(stream-handle: u64) -> result<option<u64>, string>;
+
+    /// IP TTL on outgoing packets. TCP-only.
+    net-set-ttl: func(stream-handle: u64, ttl: u32) -> result<_, string>;
+    net-ttl:     func(stream-handle: u64) -> result<u32, string>;
 }
 ```
 
-No new types. No new interface. No change to existing functions. A capsule that does not call `net-connect-tcp` is byte-identical at the WIT-bindgen layer.
+The legacy `net-read` / `net-write` (length-prefixed envelopes used by the inbound Unix-accept proxy) keep their existing framing. The new `net-read-bytes` / `net-write-bytes` are the byte-stream surface for outbound TCP — same `stream-handle` type, different framing semantics, documented in-band.
+
+A capsule that does not call any of the new fns is byte-identical at the WIT-bindgen layer.
 
 ## Manifest schema change
 
@@ -321,7 +357,7 @@ The `net-accept` path *does* length-prefix because the Unix proxy capsule uses f
 
 - **Adds a new SSRF attack surface.** Every outbound-network primitive is a potential server-side request forgery vector. The mitigation is the same airlock `http-request` already runs — but bugs in `is_safe_ip`, DNS rebinding races (a name resolves to a public IP at capability check and a private IP at connect), and TOCTOU between resolve and connect all become reachable from one more host fn. We accept the added surface because `http-request` already carries the same airlock and the bugs would be shared; widening the surface from "HTTP only" to "HTTP and TCP" does not introduce a new class of vulnerability, only a new place to express it.
 
-- **Length-prefix framing is wrong for raw TCP.** The `net-read` / `net-write` interface assumes framed envelopes (its first consumer was the Unix CLI proxy). Reusing it for outbound TCP means every byte-stream consumer pays a 4-byte framing overhead per read/write. We accept this for the first version — splitting framed and unframed reads is a strictly-additive follow-up, and the framing overhead is invisible for protocols that frame themselves (WebSocket, MQTT, Postgres). HTTP/1.1 consumers pay 8 bytes per request/response, which is in the noise.
+- **Dual framing in one interface.** The `net` interface now carries two distinct read/write surfaces: the framed legacy pair (`net-read` / `net-write`) for the inbound Unix-accept proxy, and the byte-stream pair (`net-read-bytes` / `net-write-bytes`) for std-style outbound TCP. Both operate on the same `stream-handle` type. Capsule authors picking the wrong one for their protocol get a wire-mismatch bug rather than a compile error. The cost of merging them away — renaming `net-read` to `net-read-framed` — was a breaking change for every uplink capsule already in production, and we judged the documented dual surface less costly than the migration. The CLI proxy use case is structurally framed; outbound TCP use cases are structurally byte-stream; choosing the matching pair is a one-line decision in the SDK glue.
 
 - **The capability surface grows.** `net_connect` is the seventh capability declaration on `[capabilities]` (after `fs_read`, `fs_write`, `host_process`, `net_bind`, `ipc_publish`, `ipc_subscribe`). Each one is a small thing on its own; the cumulative cognitive load on capsule authors is real. We accept this because the alternative is "the host has no outbound TCP" — capsule authors who need TCP would have to write that capability declaration anyway, just on a different ABI.
 
