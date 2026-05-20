@@ -158,15 +158,30 @@ will eventually formalize for `cli.v1.command.execute`. Two things to note:
 
 ## Storage layout
 
-The capsule's per-principal KV scope holds three key families. Layout is
-identical to the legacy `astrid-storage::identity` store so the cutover
-reads existing records without migration:
+The capsule's per-principal KV scope holds three key families:
 
 | Key | Value | Purpose |
 |---|---|---|
 | `user/{uuid}` | JSON `AstridUser` | Canonical user record. |
 | `link/{platform}/{platform_user_id}` | JSON `FrontendLink` | Platform link, composite key. |
 | `name/{display_name}` | UTF-8 UUID string | Best-effort display-name lookup index (last writer wins). |
+
+The key scheme matches the legacy `astrid-storage::identity` store
+byte-for-byte. The value shapes follow the WIT contract rather than
+the kernel's Rust serialization — three deliberate divergences:
+
+* `AstridUser.public_key` is `option<list<u8>>` (the WIT shape); the
+  kernel encodes the same bytes as a base64 string.
+* `created_at` / `linked_at` are millisecond-precision RFC 3339
+  strings; the kernel uses chrono's default microsecond precision.
+* `AstridUser` carries no `principal` field. The capsule's per-
+  principal KV scope already encodes the principal, so the kernel
+  record's `principal: PrincipalId` is redundant and is dropped on
+  the first capsule-side re-write.
+
+Pre-launch there are no production records to migrate. A migration
+tool added at cutover time transforms kernel records into capsule
+records (base64-decode keys, reformat timestamps, strip principal).
 
 `platform` and `platform_user_id` MUST be validated to reject `/` and `\0`
 before key construction. Without that gate, a caller passing
