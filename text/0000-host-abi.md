@@ -112,33 +112,51 @@ correct.
 
 ## Host interfaces
 
-51 host functions organized into 12 domain interfaces:
+65 host functions organized into 11 domain packages, plus the `astrid:guest`
+export contract:
 
-| Interface | Functions | Capability | Purpose |
+| Package | Functions | Capability | Purpose |
 |---|---|---|---|
-| `fs` | 7 | `fs_read`, `fs_write` | Virtual filesystem (workspace://, home://, tmp://) |
-| `ipc` | 6 | `ipc_publish`, `ipc_subscribe` | IPC event bus: publish, subscribe, receive |
-| `uplink` | 2 | `uplink` | Frontend connection registration and response sending |
-| `kv` | 5 | (ungated) | Per-capsule key-value store, auto-scoped per principal |
-| `net` | 6 | `net` | Unix socket I/O for capsule-to-daemon communication |
-| `http` | 4 | `net` | HTTP client with streaming (SSE) support |
-| `sys` | 7 | (ungated) | Logging, config, time, hooks, capability introspection |
-| `cron` | 2 | `cron` | Scheduled recurring tasks |
-| `process` | 4 | `host_process` | Sandboxed host process spawning (Seatbelt/bwrap) |
-| `elicit` | 2 | `uplink` | Interactive user input (prompts, selections) |
-| `approval` | 1 | (ungated) | Human-in-the-loop approval gates |
-| `identity` | 5 | `identity` | User identity CRUD and platform linking |
+| `astrid:fs` | 7 | `fs_read`, `fs_write` | Virtual filesystem (workspace://, home://, tmp://) |
+| `astrid:ipc` | 7 | `ipc_publish`, `ipc_subscribe` | IPC event bus: publish, subscribe, receive |
+| `astrid:uplink` | 2 | `uplink` | Frontend connection registration and response sending |
+| `astrid:kv` | 5 | (ungated) | Per-capsule key-value store, auto-scoped per principal |
+| `astrid:net` | 21 | `net`, `net_connect` | Unix-domain sockets and gated outbound TCP |
+| `astrid:http` | 4 | `net` | HTTP client with streaming (SSE) support |
+| `astrid:sys` | 7 | (ungated) | Logging, config, time, hooks, capability introspection |
+| `astrid:process` | 4 | `host_process` | Sandboxed host process spawning (Seatbelt/bwrap) |
+| `astrid:elicit` | 2 | `uplink` | Interactive user input during install/upgrade |
+| `astrid:approval` | 1 | (ungated) | Human-in-the-loop approval gates |
+| `astrid:identity` | 5 | `identity` | User identity CRUD and platform linking |
+| `astrid:guest` | 4 exports | — | Lifecycle/interceptor entry points (capsule → kernel) |
 
-A 13th block, `types`, defines shared types (`log-level`, `key-value-pair`,
-`capsule-context`, `capsule-result`) used across interfaces. It has no functions.
+### WASI primitives also available
+
+Capsules see WASI alongside the `astrid:*` packages. The kernel adds
+`wasmtime_wasi::p2` to the linker, so capsule authors should reach for the
+WASI imports for general-purpose primitives rather than expecting Astrid to
+re-expose them:
+
+| Need | WASI package | Why not in `astrid:*` |
+|---|---|---|
+| Cryptographically secure random bytes | `wasi:random/random` | Standard primitive; no Astrid-specific capability gating needed. |
+| Monotonic clock (timeouts, latency, scheduling) | `wasi:clocks/monotonic-clock` | Standard primitive; `astrid:sys.clock-ms` exists for wall-clock only. |
+| Wall clock with structured datetime | `wasi:clocks/wall-clock` | Standard primitive. |
+| Stream I/O abstractions | `wasi:io/streams` | Foundation for any future Astrid streaming additions. |
+| Sleep / await duration | `wasi:clocks/monotonic-clock.subscribe-duration` | Standard primitive. |
+
+`astrid:*` exists where Astrid layers capability gating, principal scoping,
+or audit on top of what would otherwise be a syscall (`astrid:fs` for VFS-
+scheme resolution, `astrid:net` for `net_connect` allowlists, etc.). Where
+no such layering is needed, capsules use WASI directly.
 
 ### Capability model
 
 Each host function checks the calling capsule's declared capabilities:
 
 - **Gated:** `fs_read`, `fs_write`, `ipc_publish`, `ipc_subscribe`, `uplink`,
-  `net`, `cron`, `host_process`, `identity`. Capsules must declare these in
-  `[capabilities]` in Capsule.toml.
+  `net`, `net_connect`, `host_process`, `identity`. Capsules must declare
+  these in `[capabilities]` in Capsule.toml.
 - **Ungated:** `kv`, `sys`, `approval`. Always available. KV is safe because
   it's namespace-scoped per capsule and principal. Sys functions are read-only
   or side-effect-free. Approval is a request, not an action.
@@ -237,32 +255,22 @@ The naming is symmetric with the per-domain `host` interfaces: `host` is
 kernel-side (imported by capsules), `guest` is capsule-side (called by the
 kernel).
 
-Per-export worlds matter for a concrete reason. The wasm32-wasip2 toolchain
-auto-stubs every export declared in the world a component targets. A single
-world covering all four entry points (`astrid-hook-trigger`, `run`,
-`astrid-install`, `astrid-upgrade`) forces stubs for the ones a given
-capsule does not implement, which then pushes the kernel into parsing the
-wasm binary to distinguish real implementations from toolchain stubs
-(`core/crates/astrid-capsule/src/engine/wasm/mod.rs` `STUB_PRONE_EXPORTS`
-carries that hack today). Per-export worlds eliminate the cause: an export
-only appears in the wasm binary when the capsule actually implements it,
-so the kernel can drop the parsing hack and use plain export-presence
+Per-export worlds matter because the wasm32-wasip2 toolchain auto-stubs
+every export declared in the world a component targets. A single world
+covering all four entry points would force stubs for the ones a given
+capsule does not implement, and the kernel would have to parse the wasm
+binary to distinguish real implementations from toolchain stubs. Per-export
+worlds eliminate the cause: an export appears in the binary only when the
+capsule actually implements it, and the kernel uses plain export-presence
 checks.
-
-An earlier draft of this RFC proposed a minimal `astrid:core` package for
-cross-cutting types (`principal`, `caller-context`, common error shapes).
-Auditing the actual types in the monolithic file showed that nothing is
-genuinely cross-cutting: `caller-context` is used only by `sys.get-caller`,
-`principal` is `option<string>` everywhere (a primitive, no shared type
-needed), and error shapes are `result<T, string>` (also primitive). The
-zero-shared alternative is purer and cheaper, so `astrid:core` is **not**
-introduced.
 
 Each domain package owns its own types in a single `host` interface alongside
 its functions. `ipc-envelope`/`ipc-message` live in `astrid:ipc/host`,
 `file-stat` lives in `astrid:fs/host`, and so on. Per-domain type ownership
 isolates per-domain evolution: bumping `astrid:net` does not recompile
-anything that only imports `astrid:kv`.
+anything that only imports `astrid:kv`. There is no shared cross-cutting
+package — primitives (`option<string>` for principals, `result<T, string>`
+for errors) cover the only types that would otherwise be candidates.
 
 Capsules opt into exactly the subset they need on both axes — which guest
 exports they implement and which host imports they use:
@@ -341,6 +349,39 @@ file matching `*@X.Y.Z.wit` that exists on the base ref fails the build. New
 files matching the pattern are allowed — that is the legitimate evolution
 path.
 
+### Versioning rules
+
+A WIT package version follows semver with one constraint imposed by the
+Component Model linker: the linker is structurally typed per `(package,
+version)` pair, so any change that produces a different shape is a contract
+break from the linker's perspective regardless of intent. The version number
+is therefore a signal to capsule authors about what they will have to do
+when they bump.
+
+| Change | Bump | Rationale |
+|---|---|---|
+| Add a new top-level function to an interface | **MINOR** | Existing function and type shapes are exactly preserved; old capsules' generated bindings are unaffected. The kernel registers the new minor as a fresh `(package, version)` pair and the old minor's implementation falls out as a subset. |
+| Add a field to a record | **MAJOR** | Even `option<>` fields produce a different record layout in `wit-bindgen` output. Old capsules built against the prior shape fail to instantiate. |
+| Add a variant to an enum | **MAJOR** | Different shape; exhaustive matches on return-position enums in old capsules break on regenerate. |
+| Change a function signature | **MAJOR** | Obvious. |
+| Remove a function, field, or variant | **MAJOR** | Obvious. |
+
+Only purely orthogonal additions — new top-level functions on existing
+interfaces — qualify as minor bumps, because they are the only change that
+leaves the existing shape exactly preserved. Any touch of an existing
+record, enum, or function signature is major. This is conservative relative
+to the cultural "additive = minor" convention in other ecosystems and
+matches the Component Model linker's actual semantics.
+
+`Capsule.toml` accepts Cargo-style version constraints
+(`ipc = "^1.0"`) in `[imports.astrid]`. The constraint expresses the
+capsule author's intent — "I tolerate any 1.x" — while the wasm binary
+still pins the exact version it was built against. The kernel's
+multi-version registration policy (Rule 2) is what reconciles the two:
+the kernel registers every minor in the supported window, so any 1.x
+capsule loads against any 1.y kernel where y ≥ x and both are inside the
+window.
+
 ### Scope boundary: capsule-to-kernel vs capsule-to-capsule
 
 This evolution discipline governs the **kernel ↔ capsule** boundary — the WIT
@@ -372,14 +413,11 @@ payload changes break consumers, and only at runtime.
   build time and binary size grow with the number of supported versions
   rather than being constant. Mitigated by the support-window policy, but it
   is a real cost.
-- **Zero-shared means no central place for genuinely cross-cutting types if
-  one emerges later.** The RFC settled on zero shared types after the audit
-  showed nothing in the current ABI is genuinely cross-cutting. If a future
-  evolution introduces a type that genuinely belongs in multiple domain
-  packages, the choice is duplicate-and-keep-in-sync (more surface) or
-  introduce `astrid:core` at that point (delayed but unavoidable cost). The
-  current bet is that genuinely cross-cutting types are rare; if that bet is
-  wrong, `astrid:core` ships as a follow-up.
+- **No central package for genuinely cross-cutting types.** Each domain owns
+  its own types. If a future evolution introduces a type that genuinely
+  belongs in multiple domain packages, the choice is duplicate-and-keep-in-
+  sync (more surface) or introduce a shared package at that point. The bet
+  is that genuinely cross-cutting types are rare.
 
 # Rationale and alternatives
 [rationale-and-alternatives]: #rationale-and-alternatives
@@ -450,13 +488,6 @@ Gating these would add friction without security benefit.
   `caller-context` lives in `astrid:sys/host` and is returned by `get-caller`;
   if this lands, the record gets a resource counterpart and downstream
   capsules migrate to the handle-based accessor over a release.
-
-_(Previous open questions on world naming convention and the
-`astrid:capsule@0.1.0` cleanup approach were resolved during the split
-implementation. The per-domain packages expose a single `host` interface
-each; `astrid:guest` splits its four entry points across per-export worlds
-(`interceptor`, `background`, `installable`, `upgradable`); and the
-monolithic `astrid:capsule@0.1.0` is hard-cut with no deprecated alias.)_
 
 - **Support-window length.** How many versions of each package does the
   kernel pledge to load simultaneously? Two? Three? Indefinite? Each extra
