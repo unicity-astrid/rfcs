@@ -230,11 +230,24 @@ astrid:approval@1.0.0
 astrid:identity@1.0.0
 ```
 
-Plus **`astrid:guest@1.0.0`** for the guest export contract
-(`astrid-hook-trigger`, `run`, `astrid-install`, `astrid-upgrade`) and the
-`capsule-result` type those exports use. The naming is symmetric with the
-per-domain `host` interfaces: `host` is kernel-side (imported by capsules),
-`guest` is capsule-side (called by the kernel).
+Plus **`astrid:guest@1.0.0`** for the guest export contract — split into
+four per-export worlds (`interceptor`, `background`, `installable`,
+`upgradable`) so capsules `include` only the entry points they implement.
+The naming is symmetric with the per-domain `host` interfaces: `host` is
+kernel-side (imported by capsules), `guest` is capsule-side (called by the
+kernel).
+
+Per-export worlds matter for a concrete reason. The wasm32-wasip2 toolchain
+auto-stubs every export declared in the world a component targets. A single
+world covering all four entry points (`astrid-hook-trigger`, `run`,
+`astrid-install`, `astrid-upgrade`) forces stubs for the ones a given
+capsule does not implement, which then pushes the kernel into parsing the
+wasm binary to distinguish real implementations from toolchain stubs
+(`core/crates/astrid-capsule/src/engine/wasm/mod.rs` `STUB_PRONE_EXPORTS`
+carries that hack today). Per-export worlds eliminate the cause: an export
+only appears in the wasm binary when the capsule actually implements it,
+so the kernel can drop the parsing hack and use plain export-presence
+checks.
 
 An earlier draft of this RFC proposed a minimal `astrid:core` package for
 cross-cutting types (`principal`, `caller-context`, common error shapes).
@@ -251,18 +264,31 @@ its functions. `ipc-envelope`/`ipc-message` live in `astrid:ipc/host`,
 isolates per-domain evolution: bumping `astrid:net` does not recompile
 anything that only imports `astrid:kv`.
 
-Capsules opt into exactly the subset they need:
+Capsules opt into exactly the subset they need on both axes — which guest
+exports they implement and which host imports they use:
 
 ```wit
-world my-capsule {
-    include astrid:guest/exports@1.0.0;
+// Interceptor-only capsule:
+world router {
+    include astrid:guest/interceptor@1.0.0;
     import astrid:ipc/host@1.0.0;
-    import astrid:kv/host@1.0.0;
     // not net, not http — capsule does not use them
+}
+
+// Run-loop capsule with an install hook:
+world cli {
+    include astrid:guest/interceptor@1.0.0;
+    include astrid:guest/background@1.0.0;
+    include astrid:guest/installable@1.0.0;
+    import astrid:ipc/host@1.0.0;
+    import astrid:uplink/host@1.0.0;
+    import astrid:net/host@1.0.0;
 }
 ```
 
-A kv-only capsule is unaffected when `astrid:net` adds a function.
+A kv-only capsule is unaffected when `astrid:net` adds a function. An
+interceptor-only capsule produces no `run` / install / upgrade exports in
+its wasm binary, so the kernel sees only what is real.
 
 ### Rule 2: multi-version kernel registration
 
@@ -425,20 +451,12 @@ Gating these would add friction without security benefit.
   if this lands, the record gets a resource counterpart and downstream
   capsules migrate to the handle-based accessor over a release.
 
-- **World naming convention.** Per-domain packages can expose `astrid:ipc/host`
-  vs `astrid:ipc/guest` worlds for the two directions, or a single
-  `astrid:ipc` world that imports/exports as needed. The first matches
-  wasmtime CM idiom and makes the split between host-provided imports and
-  guest-provided exports explicit; the second is terser. Worth checking
-  against current wasmtime examples before committing.
-
-- **Pre-1.0 cleanup approach for `astrid:capsule@0.1.0`.** Hard cut (delete
-  the monolithic package, force every first-party capsule to migrate before
-  1.0 ships) versus deprecated alias (keep it loadable for a release or two,
-  log deprecation warnings). The RFC leans hard-cut: pre-1.0 we have license
-  to break, post-1.0 we do not, and an alias means the new model has to
-  coexist with the dead one in codegen forever. Decision deferred to the
-  implementation PR.
+_(Previous open questions on world naming convention and the
+`astrid:capsule@0.1.0` cleanup approach were resolved during the split
+implementation. The per-domain packages expose a single `host` interface
+each; `astrid:guest` splits its four entry points across per-export worlds
+(`interceptor`, `background`, `installable`, `upgradable`); and the
+monolithic `astrid:capsule@0.1.0` is hard-cut with no deprecated alias.)_
 
 - **Support-window length.** How many versions of each package does the
   kernel pledge to load simultaneously? Two? Three? Indefinite? Each extra
