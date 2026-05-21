@@ -14,10 +14,10 @@ scoped.
 Pre-1.0, the ABI also adopts an evolution discipline to make post-1.0 changes
 non-fatal for third-party capsules: the monolithic `astrid:capsule@0.1.0`
 package splits into per-domain packages (`astrid:ipc@1.0.0`, `astrid:net@1.0.0`,
-…) plus a minimal `astrid:core@1.0.0`; the kernel registers every supported
-`(package, version)` pair into the wasmtime Component Model linker explicitly;
-and once a WIT file is published it is immutable forever — shape changes ship
-as new files at new versions.
+…) plus `astrid:guest@1.0.0` for the lifecycle export contract; the kernel
+registers every supported `(package, version)` pair into the wasmtime
+Component Model linker explicitly; and once a WIT file is published it is
+immutable forever — shape changes ship as new files at new versions.
 
 # Motivation
 [motivation]: #motivation
@@ -98,9 +98,12 @@ directory, transparently.
 
 The authoritative function-level specification lives in the
 [`unicity-astrid/wit`](https://github.com/unicity-astrid/wit) repository as a
-set of per-domain WIT files (`interfaces/<name>@<version>.wit`). The kernel
+set of per-domain WIT files (`host/<name>@<version>.wit`). The kernel
 vendors a snapshot at `core/wit/` for its build, but the canonical source is
-the WIT repo.
+the WIT repo. (Note: the `host/` directory holds the kernel-to-capsule ABI
+covered by this RFC; the unrelated `interfaces/` directory holds
+capsule-to-capsule IPC event contracts, which are governed by topic
+versioning rather than the WIT discipline below.)
 
 This RFC documents the design rationale, capability model, scoping semantics,
 and evolution discipline. The WIT files are the reference for function
@@ -209,38 +212,50 @@ one without the others is wasted work.
 
 ### Rule 1: per-domain packages
 
-The pre-1.0 monolithic `astrid:capsule@0.1.0` package containing 12 interfaces
-is replaced by one package per domain:
+The pre-1.0 monolithic `astrid:capsule@0.1.0` package containing 11 functional
+interfaces plus a shared `types` interface is replaced by one package per
+domain:
 
 ```
-astrid:ipc@1.0.0
-astrid:net@1.0.0
-astrid:kv@1.0.0
-astrid:http@1.0.0
 astrid:fs@1.0.0
-astrid:process@1.0.0
+astrid:ipc@1.0.0
+astrid:uplink@1.0.0
+astrid:kv@1.0.0
+astrid:net@1.0.0
+astrid:http@1.0.0
 astrid:sys@1.0.0
-astrid:cron@1.0.0
+astrid:process@1.0.0
 astrid:elicit@1.0.0
 astrid:approval@1.0.0
-astrid:uplink@1.0.0
 astrid:identity@1.0.0
 ```
 
-Plus a minimal **`astrid:core@1.0.0`** for truly cross-cutting types only
-(`principal`, `caller-context`, common error shapes). This package is kept as
-small as humanly possible; every type that lives in it ripples across every
-interface that imports it, so each entry is justified individually.
+Plus **`astrid:guest@1.0.0`** for the guest export contract
+(`astrid-hook-trigger`, `run`, `astrid-install`, `astrid-upgrade`) and the
+`capsule-result` type those exports use. The naming is symmetric with the
+per-domain `host` interfaces: `host` is kernel-side (imported by capsules),
+`guest` is capsule-side (called by the kernel).
 
-Each domain package owns its own types. `astrid:ipc/types` (`ipc-envelope`,
-`ipc-message`) lives in `astrid:ipc`, not in a shared types module. Per-domain
-type ownership isolates per-domain evolution: bumping `astrid:net` does not
-recompile anything that only imports `astrid:kv`.
+An earlier draft of this RFC proposed a minimal `astrid:core` package for
+cross-cutting types (`principal`, `caller-context`, common error shapes).
+Auditing the actual types in the monolithic file showed that nothing is
+genuinely cross-cutting: `caller-context` is used only by `sys.get-caller`,
+`principal` is `option<string>` everywhere (a primitive, no shared type
+needed), and error shapes are `result<T, string>` (also primitive). The
+zero-shared alternative is purer and cheaper, so `astrid:core` is **not**
+introduced.
+
+Each domain package owns its own types in a single `host` interface alongside
+its functions. `ipc-envelope`/`ipc-message` live in `astrid:ipc/host`,
+`file-stat` lives in `astrid:fs/host`, and so on. Per-domain type ownership
+isolates per-domain evolution: bumping `astrid:net` does not recompile
+anything that only imports `astrid:kv`.
 
 Capsules opt into exactly the subset they need:
 
 ```wit
 world my-capsule {
+    include astrid:guest/exports@1.0.0;
     import astrid:ipc/host@1.0.0;
     import astrid:kv/host@1.0.0;
     // not net, not http — capsule does not use them
@@ -280,11 +295,11 @@ This requires:
 
 ### Rule 3: frozen WIT files per version
 
-Once `astrid:ipc@1.0.0` ships, the file at `interfaces/ipc@1.0.0.wit` is
+Once `astrid:ipc@1.0.0` ships, the file at `host/ipc@1.0.0.wit` is
 **immutable forever**. New shapes get a new file:
 
 ```
-interfaces/
+host/
   ipc@1.0.0.wit           # frozen
   ipc@1.1.0.wit           # frozen
   ipc@2.0.0.wit           # current
@@ -295,9 +310,10 @@ path, modify, register the new version in the kernel, leave the old files
 alone. The current pattern of editing a WIT file in place ends.
 
 This is enforced by a CI lint (`scripts/lint-wit-immutability.sh`) in the
-`unicity-astrid/wit` repository: any PR that touches a file matching
-`*@X.Y.Z.wit` where that version is referenced in a kernel release manifest
-fails the build. New shapes = new file, with no exceptions.
+`unicity-astrid/wit` repository: any PR that modifies, deletes, or renames a
+file matching `*@X.Y.Z.wit` that exists on the base ref fails the build. New
+files matching the pattern are allowed — that is the legitimate evolution
+path.
 
 ### Scope boundary: capsule-to-kernel vs capsule-to-capsule
 
@@ -330,11 +346,14 @@ payload changes break consumers, and only at runtime.
   build time and binary size grow with the number of supported versions
   rather than being constant. Mitigated by the support-window policy, but it
   is a real cost.
-- **Per-domain ownership of cross-cutting types is awkward.** `principal` and
-  `caller-context` either live in a shared `astrid:core` package (and ripple
-  on every cross-cutting evolution) or are duplicated per interface (more
-  surface to keep in sync). Neither is free; the RFC picks the smaller-`core`
-  trade and admits the cost.
+- **Zero-shared means no central place for genuinely cross-cutting types if
+  one emerges later.** The RFC settled on zero shared types after the audit
+  showed nothing in the current ABI is genuinely cross-cutting. If a future
+  evolution introduces a type that genuinely belongs in multiple domain
+  packages, the choice is duplicate-and-keep-in-sync (more surface) or
+  introduce `astrid:core` at that point (delayed but unavoidable cost). The
+  current bet is that genuinely cross-cutting types are rare; if that bet is
+  wrong, `astrid:core` ships as a follow-up.
 
 # Rationale and alternatives
 [rationale-and-alternatives]: #rationale-and-alternatives
@@ -397,21 +416,14 @@ Gating these would add friction without security benefit.
 # Unresolved questions
 [unresolved-questions]: #unresolved-questions
 
-- **Minimal `astrid:core` vs zero-shared types.** The RFC currently picks a
-  minimal `astrid:core@1.0.0` carrying `principal`, `caller-context`, and
-  common error shapes. The strictly purer alternative is zero shared types:
-  every interface defines its own `principal`, accept the duplication, accept
-  the loss of cross-domain ergonomics, gain full per-domain evolutionary
-  independence. The trade-off pivots on how often cross-cutting types actually
-  evolve in practice — if they prove churny, zero-shared wins; if they prove
-  stable, the small-`core` design pays for itself in author ergonomics.
-
 - **Push `principal` out of payload onto a resource handle.** A resource-typed
   caller-context (host-owned, opaque handle, accessor methods) would let the
   host evolve principal representation without changing any WIT payload at
-  all. If this works, `astrid:core` shrinks further or vanishes entirely.
-  Worth a design pass before 1.0; not blocking, because the record-based ABI
-  works as long as the per-domain split + frozen-file rules hold.
+  all. Worth a design pass before 1.0; not blocking, because the record-based
+  ABI works as long as the per-domain split + frozen-file rules hold. Today
+  `caller-context` lives in `astrid:sys/host` and is returned by `get-caller`;
+  if this lands, the record gets a resource counterpart and downstream
+  capsules migrate to the handle-based accessor over a release.
 
 - **World naming convention.** Per-domain packages can expose `astrid:ipc/host`
   vs `astrid:ipc/guest` worlds for the two directions, or a single
