@@ -6,18 +6,22 @@
 # Summary
 [summary]: #summary
 
-Define the host ABI — the syscall-like interface between the Astrid kernel and
-WASM capsule guests. 51 host functions across 12 domain interfaces, plus 4
-guest exports. All operations are capability-gated, audited, and per-principal
-scoped.
+Define the host ABI — the syscall-like interface between the Astrid kernel
+and WASM capsule guests. 12 per-domain packages under `astrid:*`, a parallel
+`astrid-bus:*` namespace for capsule-to-capsule IPC schemas. Surface uses
+typed Component Model resources for long-lived handles (`file-handle`,
+`tcp-stream`, `subscription`, `process-handle`, …) and typed per-package
+`error-code` variants for failures. All operations are capability-gated,
+audited, and per-principal scoped.
 
-Pre-1.0, the ABI also adopts an evolution discipline to make post-1.0 changes
+The 1.0 ABI also adopts an evolution discipline to make post-1.0 changes
 non-fatal for third-party capsules: the monolithic `astrid:capsule@0.1.0`
-package splits into per-domain packages (`astrid:ipc@1.0.0`, `astrid:net@1.0.0`,
-…) plus `astrid:guest@1.0.0` for the lifecycle export contract; the kernel
-registers every supported `(package, version)` pair into the wasmtime
-Component Model linker explicitly; and once a WIT file is published it is
-immutable forever — shape changes ship as new files at new versions.
+package splits into per-domain packages (`astrid:ipc@1.0.0`,
+`astrid:net@1.0.0`, …) plus `astrid:guest@1.0.0` for the lifecycle export
+contract; the kernel registers every supported `(package, version)` pair
+into the wasmtime Component Model linker explicitly; and once a WIT file
+is published it is immutable forever — shape changes ship as new files at
+new versions.
 
 # Motivation
 [motivation]: #motivation
@@ -112,56 +116,78 @@ correct.
 
 ## Host interfaces
 
-65 host functions organized into 11 domain packages, plus the `astrid:guest`
-export contract:
+12 per-domain packages under `astrid:*` (the kernel ABI). Each package's
+surface is a mix of methods on typed resources (long-lived handles) and
+top-level functions on the `host` interface.
 
-| Package | Functions | Capability | Purpose |
+| Package | Surface | Capability | Purpose |
 |---|---|---|---|
-| `astrid:fs` | 7 | `fs_read`, `fs_write` | Virtual filesystem (workspace://, home://, tmp://) |
-| `astrid:ipc` | 7 | `ipc_publish`, `ipc_subscribe` | IPC event bus: publish, subscribe, receive |
-| `astrid:uplink` | 2 | `uplink` | Frontend connection registration and response sending |
-| `astrid:kv` | 5 | (ungated) | Per-capsule key-value store, auto-scoped per principal |
-| `astrid:net` | 21 | `net`, `net_connect` | Unix-domain sockets and gated outbound TCP |
-| `astrid:http` | 4 | `net` | HTTP client with streaming (SSE) support |
-| `astrid:sys` | 7 | (ungated) | Logging, config, time, hooks, capability introspection |
-| `astrid:process` | 4 | `host_process` | Sandboxed host process spawning (Seatbelt/bwrap) |
-| `astrid:elicit` | 2 | `uplink` | Interactive user input during install/upgrade |
-| `astrid:approval` | 1 | (ungated) | Human-in-the-loop approval gates |
-| `astrid:identity` | 5 | `identity` | User identity CRUD and platform linking |
-| `astrid:guest` | 4 exports | — | Lifecycle/interceptor entry points (capsule → kernel) |
+| `astrid:fs` | `file-handle` resource + path ops | `fs_read`, `fs_write` | Virtual filesystem (workspace://, home://, tmp://); file IO, metadata, canonicalize, hard-link |
+| `astrid:ipc` | `subscription` resource + publish/publish-as | `ipc_publish`, `ipc_subscribe`, `uplink` (publish-as) | IPC event bus with `principal-attribution` verified/claimed distinction |
+| `astrid:uplink` | uplink-register/send | `uplink` | Frontend connection registration |
+| `astrid:kv` | get/set/delete/cas/list/list-page/clear-prefix | (ungated) | Per-capsule, per-principal key-value with atomic CAS |
+| `astrid:net` | `unix-listener` / `tcp-listener` / `tcp-stream` / `udp-socket` resources + factories | `net`, `net_connect`, `net_udp`, `net_tcp_bind` | Unix sockets, outbound TCP, inbound TCP, UDP (unconnected + connected), DNS resolution |
+| `astrid:http` | `http-stream` resource + http-request | `net` | HTTP client with SSRF airlock, streaming responses, typed method enum |
+| `astrid:sys` | log, config, get-caller, clock-ms, clock-monotonic-ns, sleep-ns, random-bytes, check-capsule-capability | (ungated) | Logging, manifest config, time, entropy, capability introspection |
+| `astrid:process` | `process-handle` resource + spawn/spawn-background | `host_process` | OS-sandboxed (Seatbelt/bwrap) spawn with stdin/env/cwd, wait/signal/kill, exit-info |
+| `astrid:elicit` | elicit/has-secret | `uplink` | Install/upgrade-time user prompts with typed elicit-type and elicit-response |
+| `astrid:approval` | request-approval | (ungated) | Human-in-the-loop gate with typed approval-decision |
+| `astrid:identity` | resolve/link/unlink/create-user/list-links | `identity` | Multi-platform identity (per-operation typed responses) |
+| `astrid:guest` | Per-export worlds: `interceptor` / `background` / `installable` / `upgradable` | — | Lifecycle entry points (kernel → capsule); capsules `include` only what they implement |
 
-### WASI primitives also available
+### Capsule-to-capsule contracts live in a distinct `astrid-bus:*` namespace
 
-Capsules see WASI alongside the `astrid:*` packages. The kernel adds
-`wasmtime_wasi::p2` to the linker, so capsule authors should reach for the
-WASI imports for general-purpose primitives rather than expecting Astrid to
-re-expose them:
+The host ABI above (`astrid:*`) covers direct kernel-mediated calls. A
+parallel namespace `astrid-bus:*` lives in `interfaces/*.wit` and carries
+the schemas for events flowing between capsules over the IPC bus
+(`astrid-bus:llm`, `astrid-bus:session`, `astrid-bus:tool`, etc.). The two
+are different layers — host calls go through the wasmtime CM linker; bus
+events are typed payloads on `astrid:ipc`. The namespace split makes the
+layering visible in capsule worlds and `Capsule.toml`:
 
-| Need | WASI package | Why not in `astrid:*` |
-|---|---|---|
-| Cryptographically secure random bytes | `wasi:random/random` | Standard primitive; no Astrid-specific capability gating needed. |
-| Monotonic clock (timeouts, latency, scheduling) | `wasi:clocks/monotonic-clock` | Standard primitive; `astrid:sys.clock-ms` exists for wall-clock only. |
-| Wall clock with structured datetime | `wasi:clocks/wall-clock` | Standard primitive. |
-| Stream I/O abstractions | `wasi:io/streams` | Foundation for any future Astrid streaming additions. |
-| Sleep / await duration | `wasi:clocks/monotonic-clock.subscribe-duration` | Standard primitive. |
+```toml
+[imports.astrid]
+fs = "1.0.0"
+ipc = "1.0.0"
 
-`astrid:*` exists where Astrid layers capability gating, principal scoping,
-or audit on top of what would otherwise be a syscall (`astrid:fs` for VFS-
-scheme resolution, `astrid:net` for `net_connect` allowlists, etc.). Where
-no such layering is needed, capsules use WASI directly.
+[imports.astrid-bus]
+llm = "^1.0"
+session = "^1.0"
+```
+
+### Foundation primitives — minimal WASI retention
+
+The kernel exposes `wasi:io/poll@0.2.0` and `wasi:io/streams@0.2.0` to
+capsules — these are the Component Model's standard `pollable` /
+`input-stream` / `output-stream` resource types, and dropping them would
+leave capsules unable to use the CM's async-readiness composition story.
+Everything else from WASI (filesystem, sockets, clocks, random, cli) is
+**not** in the linker: those operations would bypass Astrid's capability
+gates, principal scoping, and audit chain. Random / monotonic clock /
+sleep / wall-clock live under `astrid:sys` instead, so every host call
+goes through the same audit layer.
+
+The retention pays off through `subscribe-readiness` / `subscribe-readable`
+/ `subscribe-exit` / `subscribe-logs` methods on the Astrid resources —
+they return `wasi:io/poll.pollable`, so capsule code can call
+`wasi:io/poll.poll([…])` to multiplex IPC + Unix sockets + TCP + UDP +
+HTTP-stream chunks + child-process exits without embedding a runtime
+purely for that.
 
 ### Capability model
 
 Each host function checks the calling capsule's declared capabilities:
 
 - **Gated:** `fs_read`, `fs_write`, `ipc_publish`, `ipc_subscribe`, `uplink`,
-  `net`, `net_connect`, `host_process`, `identity`. Capsules must declare
-  these in `[capabilities]` in Capsule.toml.
+  `net`, `net_connect`, `net_udp`, `net_tcp_bind`, `host_process`,
+  `identity`. Capsules must declare these in `[capabilities]` in
+  `Capsule.toml`.
 - **Ungated:** `kv`, `sys`, `approval`. Always available. KV is safe because
   it's namespace-scoped per capsule and principal. Sys functions are read-only
   or side-effect-free. Approval is a request, not an action.
 
-Violations return an error to the guest and are logged to the audit chain.
+Violations return `capability-denied` (a variant arm of the per-package
+`error-code`) to the guest and are logged to the audit chain.
 
 ### VFS scheme resolution
 
@@ -186,27 +212,52 @@ namespaces depending on who is calling — transparent to the capsule author.
 
 ## Guest exports
 
-Capsules export up to 4 entry points:
+Guest exports live in `astrid:guest@1.0.0`, split into per-export worlds so
+capsules `include` only the entry points they implement. Each world matches
+a single export — the toolchain only emits the export when its world is
+included, so the kernel sees only real implementations (no stub-detection
+parsing needed).
 
-| Export | Description | Required |
+| World | Export | Required if included |
 |---|---|---|
-| `astrid-hook-trigger` | Interceptor handler — receives action + payload, returns `InterceptResult` bytes (see [interceptor chain RFC](0000-interceptor-chain.md)) | No |
-| `run` | Background task entry point — capsules with run loops (IPC subscribers) | No |
-| `astrid-install` | Called once after first installation — setup KV state, validate config | No |
-| `astrid-upgrade` | Called after version upgrade — receives previous version for migrations | No |
+| `interceptor` | `astrid-hook-trigger(action, payload)` returning `capsule-result` | Most capsules — handles routed events |
+| `background` | `run()` | Capsules with a long-lived IPC subscriber loop |
+| `installable` | `astrid-install()` | One-time install hook (may use `elicit` for secrets/config) |
+| `upgradable` | `astrid-upgrade()` | Version-upgrade hook |
 
-Capsules without `run` are "on-demand" — they only execute when an interceptor
-or tool is invoked. Capsules with `run` start a background task that subscribes
-to IPC topics and processes events in a loop.
+A typical capsule world:
+
+```wit
+world cli {
+    include astrid:guest/interceptor@1.0.0;
+    include astrid:guest/background@1.0.0;
+    include astrid:guest/installable@1.0.0;
+    import astrid:ipc/host@1.0.0;
+    import astrid:uplink/host@1.0.0;
+    import astrid:net/host@1.0.0;
+}
+```
 
 ## Error handling
 
-Host functions that can fail return `result<T, string>` natively through the
-Component Model. The error string describes the failure; the SDK converts it
-to `Result<T, SysError>`. Capability violations include the missing capability
-name in the error message. Unrecoverable errors (lock poisoning, memory
-exhaustion) trap — those represent kernel invariant violations, not
-guest-recoverable conditions.
+Host functions return `result<T, error-code>` where `error-code` is a typed
+variant per package — `astrid:fs/host.error-code`, `astrid:net/host.error-code`,
+etc. Specific arms (`not-found`, `capability-denied`, `would-block`,
+`is-directory`, `boundary-escape`, `airlock-rejected`, etc.) cover the
+common cases; a catch-all `unknown(string)` arm carries best-effort host
+detail for unforeseen errors without forcing an ABI bump.
+
+The SDK translates per-package `error-code` to language-idiomatic errors
+(`Result<T, SysError>` in Rust where `SysError` carries the source variant).
+Capsule code pattern-matches on the specific arms.
+
+Error strings (the `unknown` arm payload) are constrained: no host
+real-paths, IP addresses, UUIDs, or capability names leak through. The
+specific-arm enumeration is the contract; the string is for human
+debugging only.
+
+Unrecoverable errors (lock poisoning, memory exhaustion) trap — those
+represent kernel invariant violations, not guest-recoverable conditions.
 
 ## ABI evolution discipline
 
@@ -264,13 +315,15 @@ worlds eliminate the cause: an export appears in the binary only when the
 capsule actually implements it, and the kernel uses plain export-presence
 checks.
 
-Each domain package owns its own types in a single `host` interface alongside
-its functions. `ipc-envelope`/`ipc-message` live in `astrid:ipc/host`,
-`file-stat` lives in `astrid:fs/host`, and so on. Per-domain type ownership
-isolates per-domain evolution: bumping `astrid:net` does not recompile
-anything that only imports `astrid:kv`. There is no shared cross-cutting
-package — primitives (`option<string>` for principals, `result<T, string>`
-for errors) cover the only types that would otherwise be candidates.
+Each domain package owns its own types and resources in a single `host`
+interface alongside its functions. `ipc-envelope` / `ipc-message` and the
+`subscription` resource live in `astrid:ipc/host`; `file-handle` resource
+and `file-stat` record live in `astrid:fs/host`; and so on. Per-domain
+type ownership isolates per-domain evolution: bumping `astrid:net` does not
+recompile anything that only imports `astrid:kv`. There is no shared
+cross-cutting package — each package carries its own typed `error-code`
+variant, and primitives (`option<string>` for principals, etc.) cover the
+remaining shared concepts.
 
 Capsules opt into exactly the subset they need on both axes — which guest
 exports they implement and which host imports they use:
@@ -400,9 +453,11 @@ payload changes break consumers, and only at runtime.
 # Drawbacks
 [drawbacks]: #drawbacks
 
-- **Large surface area.** 51 host functions is a lot to maintain stable. Each
-  one is a compatibility commitment, and per-domain splitting multiplies the
-  number of independently-versioned packages the kernel must track.
+- **Large surface area.** Twelve per-domain packages with typed resources
+  and per-package error variants is a lot to maintain stable. Each public
+  method on every resource is a compatibility commitment, and per-domain
+  splitting multiplies the number of independently-versioned packages the
+  kernel must track.
 - **Host-side shim code grows with versions.** Every evolution of a shared
   type requires a translation shim in the kernel for each older version still
   in the support window. The maintenance load scales with how many versions
