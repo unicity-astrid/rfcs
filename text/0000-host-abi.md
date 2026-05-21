@@ -1,7 +1,7 @@
 - Feature Name: `host_abi`
 - Start Date: 2026-03-22
 - RFC PR: [rfcs#0000](https://github.com/unicity-astrid/rfcs/pull/0000)
-- Tracking Issue: [astrid#573](https://github.com/unicity-astrid/astrid/issues/573)
+- Tracking Issues: [astrid#573](https://github.com/unicity-astrid/astrid/issues/573), [astrid#750](https://github.com/unicity-astrid/astrid/issues/750)
 
 # Summary
 [summary]: #summary
@@ -10,6 +10,14 @@ Define the host ABI — the syscall-like interface between the Astrid kernel and
 WASM capsule guests. 51 host functions across 12 domain interfaces, plus 4
 guest exports. All operations are capability-gated, audited, and per-principal
 scoped.
+
+Pre-1.0, the ABI also adopts an evolution discipline to make post-1.0 changes
+non-fatal for third-party capsules: the monolithic `astrid:capsule@0.1.0`
+package splits into per-domain packages (`astrid:ipc@1.0.0`, `astrid:net@1.0.0`,
+…) plus a minimal `astrid:core@1.0.0`; the kernel registers every supported
+`(package, version)` pair into the wasmtime Component Model linker explicitly;
+and once a WIT file is published it is immutable forever — shape changes ship
+as new files at new versions.
 
 # Motivation
 [motivation]: #motivation
@@ -40,33 +48,35 @@ Formalizing the host ABI as an RFC ensures:
 ## Architecture
 
 ```
-┌─────────────────────────────────────┐
-│ Capsule (WASM guest)                │
-│                                     │
-│  SDK: astrid_sdk::fs::read_file()   │
-│         │                           │
-│         ▼                           │
-│  astrid-sys: astrid_fs_read()       │  ← FFI boundary
-├─────────────────────────────────────┤
-│  Host ABI (this spec)               │  ← Kernel enforces here
-│         │                           │
-│         ▼                           │
-│  Capability check → VFS resolve →   │
-│  Sandbox boundary → Audit log →     │
-│  Actual I/O                         │
-└─────────────────────────────────────┘
+┌──────────────────────────────────────────┐
+│ Capsule (WASM guest)                     │
+│                                          │
+│  SDK: astrid_sdk::fs::read_file()        │
+│         │                                │
+│         ▼                                │
+│  WIT-bindgen import: astrid:fs/host.read │  ← Component Model boundary
+├──────────────────────────────────────────┤
+│  Host ABI (this spec)                    │  ← Kernel enforces here
+│         │                                │
+│         ▼                                │
+│  Capability check → VFS resolve →        │
+│  Sandbox boundary → Audit log →          │
+│  Actual I/O                              │
+└──────────────────────────────────────────┘
 ```
 
-The SDK wraps host functions in ergonomic Rust APIs. `astrid-sys` is the raw
-FFI layer. The host ABI defines what happens at the boundary.
+The SDK wraps WIT-bindgen-generated imports in ergonomic Rust APIs. The
+Component Model boundary is typed end-to-end — there is no separate FFI shim
+layer, and there is no serialization at the call site. The host ABI defines
+what happens once a call crosses the linker.
 
 ## Wire format
 
-The current transport is Extism (not Component Model). All structured arguments
-are passed as JSON-encoded byte buffers, and all structured returns are
-JSON-encoded byte buffers. The WIT types in the canonical spec describe the
-*logical* contract. Once the kernel migrates to the WASM Component Model, these
-become actual typed parameters.
+The transport is the WASM Component Model. Arguments and returns are typed
+according to the WIT spec — records, lists, options, and `result<T, E>` are
+passed natively across the host/guest boundary by wasmtime, with no
+serialization at the call site. The WIT files are the actual import/export
+declarations, not merely documentation.
 
 ## Capability gating
 
@@ -86,12 +96,16 @@ directory, transparently.
 
 ## Canonical spec
 
-The authoritative function-level specification is the WIT file:
-[`core/wit/astrid-capsule.wit`](https://github.com/unicity-astrid/astrid/blob/main/wit/astrid-capsule.wit)
+The authoritative function-level specification lives in the
+[`unicity-astrid/wit`](https://github.com/unicity-astrid/wit) repository as a
+set of per-domain WIT files (`interfaces/<name>@<version>.wit`). The kernel
+vendors a snapshot at `core/wit/` for its build, but the canonical source is
+the WIT repo.
 
-This RFC documents the design rationale, capability model, and scoping
-semantics. The WIT file is the reference for function signatures and types.
-If this RFC and the WIT file disagree, the WIT file is correct.
+This RFC documents the design rationale, capability model, scoping semantics,
+and evolution discipline. The WIT files are the reference for function
+signatures and types. If this RFC and a WIT file disagree, the WIT file is
+correct.
 
 ## Host interfaces
 
@@ -166,30 +180,170 @@ to IPC topics and processes events in a loop.
 
 ## Error handling
 
-Host functions return errors as JSON: `{ "error": "message" }`. The SDK
-converts these to `Result<T, SysError>`. Capability violations include the
-missing capability name in the error message.
+Host functions that can fail return `result<T, string>` natively through the
+Component Model. The error string describes the failure; the SDK converts it
+to `Result<T, SysError>`. Capability violations include the missing capability
+name in the error message. Unrecoverable errors (lock poisoning, memory
+exhaustion) trap — those represent kernel invariant violations, not
+guest-recoverable conditions.
+
+## ABI evolution discipline
+
+The Component Model linker enforces structural typing on imports. A
+record-field add, a function add, or any other shape change in a published
+WIT package makes every capsule built against the prior shape fail to
+instantiate with errors of the form `component imports instance
+'astrid:capsule/ipc@0.1.0', but a matching implementation was not found in
+the linker`. This has already been observed concretely against the current
+monolithic `astrid:capsule@0.1.0` package: additive-looking changes (adding
+`principal: option<string>` to `ipc-message`, adding 14 net functions) detonate
+every capsule built before the change, because the single mega-package means
+any edit anywhere in the file is a shape change for everyone importing it.
+
+Pre-1.0, "rebuild the whole ecosystem on every change" is the recovery path.
+Post-1.0 it is not: third-party capsule authors who shipped six months ago
+and have not touched their code must keep loading.
+
+The ABI is governed by three coordinated rules. Each is load-bearing — landing
+one without the others is wasted work.
+
+### Rule 1: per-domain packages
+
+The pre-1.0 monolithic `astrid:capsule@0.1.0` package containing 12 interfaces
+is replaced by one package per domain:
+
+```
+astrid:ipc@1.0.0
+astrid:net@1.0.0
+astrid:kv@1.0.0
+astrid:http@1.0.0
+astrid:fs@1.0.0
+astrid:process@1.0.0
+astrid:sys@1.0.0
+astrid:cron@1.0.0
+astrid:elicit@1.0.0
+astrid:approval@1.0.0
+astrid:uplink@1.0.0
+astrid:identity@1.0.0
+```
+
+Plus a minimal **`astrid:core@1.0.0`** for truly cross-cutting types only
+(`principal`, `caller-context`, common error shapes). This package is kept as
+small as humanly possible; every type that lives in it ripples across every
+interface that imports it, so each entry is justified individually.
+
+Each domain package owns its own types. `astrid:ipc/types` (`ipc-envelope`,
+`ipc-message`) lives in `astrid:ipc`, not in a shared types module. Per-domain
+type ownership isolates per-domain evolution: bumping `astrid:net` does not
+recompile anything that only imports `astrid:kv`.
+
+Capsules opt into exactly the subset they need:
+
+```wit
+world my-capsule {
+    import astrid:ipc/host@1.0.0;
+    import astrid:kv/host@1.0.0;
+    // not net, not http — capsule does not use them
+}
+```
+
+A kv-only capsule is unaffected when `astrid:net` adds a function.
+
+### Rule 2: multi-version kernel registration
+
+wasmtime's Component Model has no implicit version negotiation. A version is
+either registered into the linker or it is not. The kernel therefore
+explicitly registers every `(package, version)` pair it supports:
+
+```rust
+// pseudocode
+bindings::ipc_v1_0::add_to_linker(&mut linker, host_v1_0_handler)?;
+bindings::ipc_v1_1::add_to_linker(&mut linker, host_v1_1_handler)?;
+bindings::ipc_v2_0::add_to_linker(&mut linker, host_v2_0_handler)?;
+// per package, per supported version
+```
+
+This requires:
+
+- **Build-time codegen:** one binding module per `(package, version)` pair.
+- **Host-side shims:** handlers that translate between version shapes when
+  shared types evolved. For example, if `ipc-message` gains a `principal`
+  field in v1.1, the v1.0 handler ignores it when emitting to v1.0 capsules
+  and synthesizes it from caller-context when receiving from v1.0 capsules.
+  Shims are written once per evolution, not once per capsule.
+- **Support window per package:** the kernel publishes which versions it
+  loads (e.g. `astrid:ipc@{1.0.0, 1.1.0, 2.0.0}` simultaneously).
+- **Deprecation policy:** when the kernel drops a version from the support
+  window, capsules built against it stop loading. Drop dates are announced in
+  advance, and capsules importing a soon-to-be-dropped version produce a
+  load-time warning naming the removal date.
+
+### Rule 3: frozen WIT files per version
+
+Once `astrid:ipc@1.0.0` ships, the file at `interfaces/ipc@1.0.0.wit` is
+**immutable forever**. New shapes get a new file:
+
+```
+interfaces/
+  ipc@1.0.0.wit           # frozen
+  ipc@1.1.0.wit           # frozen
+  ipc@2.0.0.wit           # current
+```
+
+When a shape change is needed: copy the latest frozen file to a new version
+path, modify, register the new version in the kernel, leave the old files
+alone. The current pattern of editing a WIT file in place ends.
+
+This is enforced by a CI lint (`scripts/lint-wit-immutability.sh`) in the
+`unicity-astrid/wit` repository: any PR that touches a file matching
+`*@X.Y.Z.wit` where that version is referenced in a kernel release manifest
+fails the build. New shapes = new file, with no exceptions.
+
+### Scope boundary: capsule-to-kernel vs capsule-to-capsule
+
+This evolution discipline governs the **kernel ↔ capsule** boundary — the WIT
+contract enforced by the wasmtime linker. It does **not** govern
+**capsule ↔ capsule** communication, which travels over the IPC bus as
+typed events on string topics (e.g. `tool.v1.execute.*`). The bus is not WIT-
+typed; capsule-to-capsule shape changes manifest at runtime as deserialization
+errors or unmatched subscriptions, not at load time as linker errors.
+
+Bus-event evolution is governed separately by the topic-versioning convention
+(`*.v1.*` → `*.v2.*`, with producers keeping the prior topic alive until
+consumers migrate). Third-party capsule authors are free to add new event
+handlers without affecting other capsules; only renames or non-additive
+payload changes break consumers, and only at runtime.
 
 # Drawbacks
 [drawbacks]: #drawbacks
 
 - **Large surface area.** 51 host functions is a lot to maintain stable. Each
-  one is a compatibility commitment.
-- **JSON wire format overhead.** Serializing/deserializing JSON for every
-  syscall is measurably slower than Component Model typed parameters. Acceptable
-  pre-1.0; the migration path (WS-8) is planned.
-- **No versioning on individual functions.** The package version (`0.1.0`)
-  covers the entire ABI. Adding a function is a minor bump; changing a
-  function signature is a major bump.
+  one is a compatibility commitment, and per-domain splitting multiplies the
+  number of independently-versioned packages the kernel must track.
+- **Host-side shim code grows with versions.** Every evolution of a shared
+  type requires a translation shim in the kernel for each older version still
+  in the support window. The maintenance load scales with how many versions
+  the kernel pledges to support concurrently — bounded by the support window
+  policy, but non-zero.
+- **Codegen volume scales with the support matrix.** One binding module per
+  `(package, version)` pair, registered explicitly into the linker, means
+  build time and binary size grow with the number of supported versions
+  rather than being constant. Mitigated by the support-window policy, but it
+  is a real cost.
+- **Per-domain ownership of cross-cutting types is awkward.** `principal` and
+  `caller-context` either live in a shared `astrid:core` package (and ripple
+  on every cross-cutting evolution) or are duplicated per interface (more
+  surface to keep in sync). Neither is free; the RFC picks the smaller-`core`
+  trade and admits the cost.
 
 # Rationale and alternatives
 [rationale-and-alternatives]: #rationale-and-alternatives
 
 ## Why WIT as the spec format?
 
-WIT is the WASM ecosystem's canonical interface definition language. When
-Astrid migrates to the Component Model, the WIT spec becomes the actual
-import/export declarations — no rewrite needed.
+WIT is the WASM ecosystem's canonical interface definition language. The
+Component Model uses WIT directly as the import/export declarations — the
+spec and the implementation are the same artefact, by construction.
 
 ## Why not fewer, coarser interfaces?
 
@@ -197,14 +351,20 @@ The original design had 7 functions in a single `host` interface. This was
 split into 13 domain interfaces because:
 - Capability gating maps to interfaces (grant `fs` without granting `net`)
 - Documentation is clearer per domain
-- Future SDK can expose per-domain modules
+- SDK exposes per-domain modules
+- Per-domain ABI versioning isolates evolution blast radius (see "ABI
+  evolution discipline" above)
 
-## Why JSON and not protobuf or msgpack?
+## Why per-domain packages instead of a single versioned `astrid:capsule`?
 
-JSON is human-readable (debugging), universally supported (every SDK language),
-and matches the IPC bus payload format. The performance cost is acceptable for
-the current scale. The Component Model migration eliminates serialization
-entirely.
+A single package (`astrid:capsule@X.Y.Z`) means every interface inside it
+shares one version. Any change to any interface — even one a given capsule
+does not import — bumps the package version, and the linker rejects the
+capsule because the imported package version no longer matches. Per-domain
+packages decouple this: bumping `astrid:net` has no effect on a capsule that
+only imports `astrid:kv`. The cost is more package versions to track; the
+benefit is that the kernel can evolve one domain at a time without recompiling
+the ecosystem.
 
 ## Why are KV and sys functions ungated?
 
@@ -224,9 +384,11 @@ Gating these would add friction without security benefit.
   extends beyond WASI with IPC, approval gates, identity, and capsule-specific
   operations.
 
-- **Extism**: Plugin framework providing the current host function transport.
-  Astrid builds on Extism's plugin model but defines its own semantic layer
-  (capabilities, audit, principal scoping) on top.
+- **wasmtime Component Model**: The actual host runtime. wasmtime's CM linker
+  enforces structural typing per `(package, version)` pair, which is the
+  mechanism this RFC's evolution discipline plays against. Astrid's per-domain
+  package split is a direct response to CM's strict typing — coarser packages
+  amplify the blast radius of any shape change, finer packages contain it.
 
 - **Envoy WASM ABI**: Host functions for proxy filters (get/set headers,
   send HTTP, log). Similar pattern: domain-specific host APIs for sandboxed
@@ -235,22 +397,48 @@ Gating these would add friction without security benefit.
 # Unresolved questions
 [unresolved-questions]: #unresolved-questions
 
-- **ABI versioning independence.** Should the ABI version be semver-independent
-  from the kernel version? Currently the WIT package version (`0.1.0`) and the
-  kernel version (`0.5.0`) are decoupled but informally linked. A stable ABI
-  version would let capsule authors target "ABI 1.0" regardless of which kernel
-  version implements it. The counter-argument: two version numbers is confusing
-  when there's only one implementation.
+- **Minimal `astrid:core` vs zero-shared types.** The RFC currently picks a
+  minimal `astrid:core@1.0.0` carrying `principal`, `caller-context`, and
+  common error shapes. The strictly purer alternative is zero shared types:
+  every interface defines its own `principal`, accept the duplication, accept
+  the loss of cross-domain ergonomics, gain full per-domain evolutionary
+  independence. The trade-off pivots on how often cross-cutting types actually
+  evolve in practice — if they prove churny, zero-shared wins; if they prove
+  stable, the small-`core` design pays for itself in author ergonomics.
+
+- **Push `principal` out of payload onto a resource handle.** A resource-typed
+  caller-context (host-owned, opaque handle, accessor methods) would let the
+  host evolve principal representation without changing any WIT payload at
+  all. If this works, `astrid:core` shrinks further or vanishes entirely.
+  Worth a design pass before 1.0; not blocking, because the record-based ABI
+  works as long as the per-domain split + frozen-file rules hold.
+
+- **World naming convention.** Per-domain packages can expose `astrid:ipc/host`
+  vs `astrid:ipc/guest` worlds for the two directions, or a single
+  `astrid:ipc` world that imports/exports as needed. The first matches
+  wasmtime CM idiom and makes the split between host-provided imports and
+  guest-provided exports explicit; the second is terser. Worth checking
+  against current wasmtime examples before committing.
+
+- **Pre-1.0 cleanup approach for `astrid:capsule@0.1.0`.** Hard cut (delete
+  the monolithic package, force every first-party capsule to migrate before
+  1.0 ships) versus deprecated alias (keep it loadable for a release or two,
+  log deprecation warnings). The RFC leans hard-cut: pre-1.0 we have license
+  to break, post-1.0 we do not, and an alias means the new model has to
+  coexist with the dead one in codegen forever. Decision deferred to the
+  implementation PR.
+
+- **Support-window length.** How many versions of each package does the
+  kernel pledge to load simultaneously? Two? Three? Indefinite? Each extra
+  version adds shim maintenance. A "N+2 minor, N-1 major" convention is one
+  option; "current and previous major" is another. Decision deferred until
+  the first post-1.0 minor bump, by which point we'll have real maintenance
+  data.
 
 - **Capability introspection depth.** `check-capsule-capability` exists but is
   limited. Should capsules be able to query the full capability set of OTHER
   capsules? This enables a system capsule to display "what can each capsule do"
   but leaks capability information across the sandbox boundary.
-
-- **Host function deprecation path.** When a host function needs to change
-  signature (e.g., adding a parameter), how is backward compatibility handled?
-  Options: versioned function names (`fs-read-v2`), optional parameters via
-  JSON, or a clean break with the Component Model migration.
 
 - **Audit chain integration.** Which host functions should produce audit
   entries? Currently logging and approval are audited. Should every `fs_write`
@@ -264,9 +452,11 @@ Gating these would add friction without security benefit.
 # Future possibilities
 [future-possibilities]: #future-possibilities
 
-- **Component Model migration.** Replace Extism transport with native WASM
-  Component Model imports/exports. WIT spec becomes the actual ABI, not just
-  documentation.
+- **Resource-typed caller-context.** Replace the payload-carried `principal`
+  field with a host-owned resource handle exposed via accessor methods. This
+  removes a cross-cutting record type from `astrid:core` entirely, letting
+  the host evolve principal representation without any WIT payload change.
+  See the corresponding open question.
 - **`astrid_system_stats` host function.** Runtime observability for the system
   capsule — per-capsule WASM heap, invocation counts, event bus metrics.
 - **Capability delegation.** A capsule grants a subset of its capabilities to
