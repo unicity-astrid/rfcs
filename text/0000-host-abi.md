@@ -197,16 +197,23 @@ that capsule X holds `host_process` grants nothing: capabilities are
 granted regardless of what it knows. Introspection is therefore a plain
 read-only view, ungated on the `sys` surface.
 
-- `enumerate-capabilities() -> list<string>` returns the **calling capsule's
-  own** *effective* capabilities — the set the kernel would enforce at
-  host-call time, not the manifest text (a runtime-revoked grant does not
-  appear). Argument-free: the kernel already knows the caller. This is the
-  primitive a capsule uses to ground its behaviour in what it can actually do
-  — an agent supervisor narrowing the tool surface it exposes, or refusing
-  work that a missing capability would only fail deep — without hard-coding an
-  assumption about its own manifest.
+- `enumerate-capabilities() -> list<string>` returns the capability **names**
+  the calling capsule holds — categories such as `host_process`, `net_connect`,
+  `fs_read`, not the scoped arguments within them (`["claude"]`, `host:port`,
+  paths). It is the dual of `check-capsule-capability`: the set of names for
+  which a self-`check` returns true. The scoped arguments stay
+  kernel-enforcement detail — a capsule grounds behaviour on *which kinds* of
+  operation it can perform, and the kernel still enforces the scope within
+  each. The set is the capsule's manifest-declared capabilities as the kernel
+  registered them; capsule capabilities are not revoked at runtime (the
+  grant/revoke model is *principal*-scoped, a separate axis), so "what I
+  declared" and "what I can do" coincide at the capsule level. Argument-free:
+  the kernel already knows the caller.
 - `check-capsule-capability({source-uuid, capability}) -> {allowed}` answers
-  the same question for a named capsule (self or other).
+  the same question for a named capsule (self or other). Implementing
+  `enumerate-capabilities` requires the kernel to expose a capsule's registered
+  capability names; `check` is brought onto that same registry so the two stay
+  consistent (it answers only a subset today).
 
 Gating cross-capsule introspection was considered and rejected as
 security-by-obscurity: the capability name space is small and published here,
@@ -214,6 +221,16 @@ UUIDs are discoverable, and — decisively — posture is not sensitive, since
 knowing a capability conveys no ability to use it. A gate would add a
 capability and a migration to buy only marginal reconnaissance-hardening,
 against Astrid's enforce-don't-conceal stance. Introspection stays a view.
+
+**When this is more than self-knowledge.** A capsule with a fixed manifest
+already knows its own capabilities — it wrote them, and they are not revoked at
+runtime — so for that capsule `enumerate-capabilities` merely restates static
+knowledge and is not load-bearing. It earns its place where self-knowledge is
+*not* static: a reusable supervisor binary deployed under different manifests or
+capability grants per deployment reads its actual set instead of hard-coding
+it, and any capsule avoids code-vs-manifest drift by grounding on the
+registered set. It is a robustness and reuse primitive, not a gate that
+statically-declared behaviour depends on.
 
 `enumerate-capabilities` also underpins the **Capability delegation** future
 possibility (see Future possibilities): a parent enumerates its own effective
