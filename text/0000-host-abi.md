@@ -128,7 +128,7 @@ top-level functions on the `host` interface.
 | `astrid:kv` | get/set/delete/cas/list/list-page/clear-prefix | (ungated) | Per-capsule, per-principal key-value with atomic CAS |
 | `astrid:net` | `unix-listener` / `tcp-listener` / `tcp-stream` / `udp-socket` resources + factories | `net`, `net_connect`, `net_udp`, `net_tcp_bind` | Unix sockets, outbound TCP, inbound TCP, UDP (unconnected + connected), DNS resolution |
 | `astrid:http` | `http-stream` resource + http-request | `net` | HTTP client with SSRF airlock, streaming responses, typed method enum |
-| `astrid:sys` | log, config, get-caller, clock-ms, clock-monotonic-ns, sleep-ns, random-bytes, check-capsule-capability | (ungated) | Logging, manifest config, time, entropy, capability introspection |
+| `astrid:sys` | log, config, get-caller, clock-ms, clock-monotonic-ns, sleep-ns, random-bytes, check-capsule-capability, enumerate-capabilities | (ungated) | Logging, manifest config, time, entropy, capability introspection (self-enumeration + per-name check) |
 | `astrid:process` | `process-handle` resource + spawn/spawn-background, **plus** a persistent tier (`spawn-persistent` → `process-id`, `attach`, id-keyed read/signal/wait/write/stop, `list-processes`/`status`, `watch`) | `host_process` (+ operator `allow_persistent` for the persistent tier) | OS-sandboxed (Seatbelt/bwrap) spawn with stdin/env/cwd, wait/signal/kill, exit-info; reattachable host-owned background processes addressed by principal-scoped id (see "Process: ephemeral and persistent tiers") |
 | `astrid:elicit` | elicit/has-secret | `uplink` | Install/upgrade-time user prompts with typed elicit-type and elicit-response |
 | `astrid:approval` | request-approval | (ungated) | Human-in-the-loop gate with typed approval-decision |
@@ -188,6 +188,36 @@ Each host function checks the calling capsule's declared capabilities:
 
 Violations return `capability-denied` (a variant arm of the per-package
 `error-code`) to the guest and are logged to the audit chain.
+
+### Capability introspection
+
+A capsule's capability set is **structural metadata, not a secret**. Knowing
+that capsule X holds `host_process` grants nothing: capabilities are
+*enforced*, not concealed, so a caller can only exercise what it was itself
+granted regardless of what it knows. Introspection is therefore a plain
+read-only view, ungated on the `sys` surface.
+
+- `enumerate-capabilities() -> list<string>` returns the **calling capsule's
+  own** *effective* capabilities — the set the kernel would enforce at
+  host-call time, not the manifest text (a runtime-revoked grant does not
+  appear). Argument-free: the kernel already knows the caller. This is the
+  primitive a capsule uses to ground its behaviour in what it can actually do
+  — an agent supervisor narrowing the tool surface it exposes, or refusing
+  work that a missing capability would only fail deep — without hard-coding an
+  assumption about its own manifest.
+- `check-capsule-capability({source-uuid, capability}) -> {allowed}` answers
+  the same question for a named capsule (self or other).
+
+Gating cross-capsule introspection was considered and rejected as
+security-by-obscurity: the capability name space is small and published here,
+UUIDs are discoverable, and — decisively — posture is not sensitive, since
+knowing a capability conveys no ability to use it. A gate would add a
+capability and a migration to buy only marginal reconnaissance-hardening,
+against Astrid's enforce-don't-conceal stance. Introspection stays a view.
+
+`enumerate-capabilities` also underpins the **Capability delegation** future
+possibility (see Future possibilities): a parent enumerates its own effective
+set to compute the strictly-smaller subset it grants a spawned child.
 
 ### VFS scheme resolution
 
@@ -743,11 +773,6 @@ Gating these would add friction without security benefit.
   option; "current and previous major" is another. Decision deferred until
   the first post-1.0 minor bump, by which point we'll have real maintenance
   data.
-
-- **Capability introspection depth.** `check-capsule-capability` exists but is
-  limited. Should capsules be able to query the full capability set of OTHER
-  capsules? This enables a system capsule to display "what can each capsule do"
-  but leaks capability information across the sandbox boundary.
 
 - **Audit chain integration.** Which host functions should produce audit
   entries? Currently logging and approval are audited. Should every `fs_write`
