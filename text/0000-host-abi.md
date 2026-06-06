@@ -263,22 +263,46 @@ record log-chunk {
     data: list<u8>, next: log-cursor, bytes-dropped: u64, drained-eof: bool,
 }
 
+/// Per-child OS resource ceilings (RLIMIT / cgroup), applicable to every tier.
+/// `none` per field => the principal's profile default. Declared in 1.0 so the
+/// record shape is stable; ENFORCEMENT is NOT YET SUPPORTED — today the host
+/// bounds only the process slot, log buffers, and lifetime, so a single child
+/// can still burn unbounded CPU/RAM. Including the fields now avoids a breaking
+/// record change once enforcement lands.
+record resource-limits {
+    /// Address-space / RSS ceiling (RLIMIT_AS or cgroup memory.max).
+    max-memory-bytes: option<u64>,
+    /// Cumulative CPU-time ceiling (RLIMIT_CPU → SIGXCPU then SIGKILL).
+    max-cpu-ms: option<u64>,
+    /// Max concurrent child PIDs (RLIMIT_NPROC / cgroup pids.max) — fork-bomb fence.
+    max-pids: option<u32>,
+    /// Max open file descriptors (RLIMIT_NOFILE).
+    max-open-files: option<u32>,
+}
+
 /// Non-draining status snapshot; unit of `list-processes` / `status`.
 record process-info {
     id: process-id, label: string, command: string, os-pid: option<u32>,
     phase: process-phase, exit: option<exit-info>, age-ms: u64, idle-ms: u64,
     buffered-bytes: u64, bytes-dropped: u64, stdin-open: bool,
+    /// Cumulative CPU time + peak resident memory the child has consumed. The
+    /// observability complement to `resource-limits`. Best-effort; `none` where
+    /// the platform doesn't surface it or NOT YET POPULATED.
+    cpu-ms: option<u64>, mem-bytes-peak: option<u64>,
 }
 
 // `spawn-request` carries persistent-only fields (label, keep-stdin-open,
 // overflow, log-ring-bytes, max-lifetime-ms, idle-timeout-ms,
 // exit-retention-ms), honored only by `spawn-persistent` and ignored by the
-// ephemeral spawns. `error-code` additionally carries: no-such-process
-// (unknown / released / wrong-principal / wrong-capsule — indistinguishable,
-// no oracle), registry-full (retained-id cap), invalid-id (malformed, returned
-// without a lookup), persist-unsupported (host cannot keep a detached child
-// contained — e.g. macOS without the operator opt-in, or an owner-fallback
-// principal).
+// ephemeral spawns, PLUS `limits: option<resource-limits>` (every tier;
+// enforcement NOT YET SUPPORTED — see the record above). `process-signal`
+// gains `stop` (SIGSTOP, pause) and `cont` (SIGCONT, resume) alongside
+// term/hup/usr1/usr2/int, so a supervisor can throttle a runaway child without
+// killing it. `error-code` additionally carries: no-such-process (unknown /
+// released / wrong-principal / wrong-capsule — indistinguishable, no oracle),
+// registry-full (retained-id cap), invalid-id (malformed, returned without a
+// lookup), persist-unsupported (host cannot keep a detached child contained —
+// e.g. macOS without the operator opt-in, or an owner-fallback principal).
 
 /// Spawn a persistent background process. Gated on `host_process` AND the
 /// operator `allow_persistent` sub-grant. Counts against BOTH the per-principal
@@ -367,6 +391,17 @@ process the daemon can no longer see is one it cannot kill, audit, or attribute,
 so re-adoption across restart is deliberately out of scope. Every persistent op
 is audited (op + principal + capsule + a hash of the id; never the raw id, env,
 stdin, or log contents).
+
+**Environment and secrets.** A child inherits **no** ambient host environment:
+the sandbox strips everything except a small kernel passthrough allowlist, and
+`spawn-request.env` is the only way variables reach the child. The intended
+model is that `env` carries operator-reviewable, non-secret configuration, and
+a **secret** reaches a child over `write-stdin` (or `spawn-request.stdin`) —
+**not** through `args`, which are recorded verbatim in the audit log. Whether
+`env` values themselves may carry secrets (and are therefore excluded from
+audit, as they already are) versus requiring an explicit secret channel is the
+one open semantics question on this surface; the field shape is unaffected
+either way.
 
 ## Guest exports
 
