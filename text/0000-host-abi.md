@@ -129,7 +129,7 @@ top-level functions on the `host` interface.
 | `astrid:net` | `unix-listener` / `tcp-listener` / `tcp-stream` / `udp-socket` resources + factories | `net`, `net_connect`, `net_udp`, `net_tcp_bind` | Unix sockets, outbound TCP, inbound TCP, UDP (unconnected + connected), DNS resolution |
 | `astrid:http` | `http-stream` resource + http-request | `net` | HTTP client with SSRF airlock, streaming responses, typed method enum |
 | `astrid:sys` | log, config, get-caller, clock-ms, clock-monotonic-ns, sleep-ns, random-bytes, check-capsule-capability | (ungated) | Logging, manifest config, time, entropy, capability introspection |
-| `astrid:process` | `process-handle` resource + spawn/spawn-background | `host_process` | OS-sandboxed (Seatbelt/bwrap) spawn with stdin/env/cwd, wait/signal/kill, exit-info |
+| `astrid:process` | `process-handle` resource + spawn/spawn-background, **plus** a persistent tier (`spawn-persistent` → `process-id`, `attach`, id-keyed read/signal/wait/write/stop, `list-processes`/`status`, `watch`) | `host_process` (+ operator `allow_persistent` for the persistent tier) | OS-sandboxed (Seatbelt/bwrap) spawn with stdin/env/cwd, wait/signal/kill, exit-info; reattachable host-owned background processes addressed by principal-scoped id (see "Process: ephemeral and persistent tiers") |
 | `astrid:elicit` | elicit/has-secret | `uplink` | Install/upgrade-time user prompts with typed elicit-type and elicit-response |
 | `astrid:approval` | request-approval | (ungated) | Human-in-the-loop gate with typed approval-decision |
 | `astrid:identity` | resolve/link/unlink/create-user/list-links | `identity` | Multi-platform identity (per-operation typed responses) |
@@ -209,6 +209,164 @@ KV namespace: `{principal}:capsule:{capsule_name}`. The principal is resolved
 from the invocation context (IPC message principal field), not the capsule's
 static configuration. This means the same capsule serves different KV
 namespaces depending on who is calling — transparent to the capsule author.
+
+### Process: ephemeral and persistent tiers
+
+`astrid:process` is gated on `host_process` and spawns every child through the
+OS sandbox (`bwrap` on Linux, `sandbox-exec`/Seatbelt on macOS) scoped to the
+workspace. It exposes **two tiers**, because a capsule's WASM instance is
+pooled and stateless — reset and returned to the pool between invocations.
+
+- **Ephemeral** — `spawn` (synchronous) and `spawn-background` (returns a
+  `process-handle` resource owned by the spawning instance's resource table;
+  the host reaps the child when the handle drops, i.e. when the instance
+  resets). Correct for fire-and-forget and within-one-invocation work.
+- **Persistent** — `spawn-persistent` returns an opaque, principal-scoped
+  `process-id` whose child lives in a **host-owned registry** (lifetime = the
+  capsule, not the instance). It is reattachable — read / signal / wait /
+  write / stop — from any *later* invocation of the same `(capsule, principal)`,
+  including a different pooled instance.
+
+The persistent tier exists because the canonical split-tool pattern — start a
+process in one tool call, read its logs in a second, stop it in a third — is
+structurally impossible with an instance-owned handle: the handle (and the
+child) is reaped when the spawning instance returns to the pool, before the
+second tool call runs. Today the only workaround is pinning such a capsule to a
+single never-reset instance, forfeiting the dynamic pool. The persistent tier
+generalizes beyond the shell capsule's background-process tools to MCP-stdio
+subprocess hosts (a long-running child you talk to across invocations),
+dev-server / build-watch supervisors, and log tailers.
+
+The persistent surface, alongside `spawn` / `spawn-background` / `process-handle`:
+
+```wit
+/// Opaque, unforgeable, principal-scoped identity for a persistent process
+/// that survives instance churn. A 256-bit host-minted CSPRNG token (host
+/// entropy, never the guest); the host stores a keyed hash and re-checks the
+/// calling principal == creator on EVERY id-keyed call, so a leaked token is
+/// inert across the principal boundary. Treat as an opaque secret.
+type process-id = string;
+
+/// Opaque, host-encoded, resumable cursor for NON-DRAINING log reads.
+record log-cursor { token: option<string> }
+enum log-stream { stdout, stderr }
+
+/// Lifecycle phase, reported WITHOUT draining logs.
+enum process-phase { starting, running, exited, reaped }
+
+/// Ring-overflow policy for a persistent stream.
+enum overflow-policy { drop-oldest, backpressure }
+
+/// Non-draining log slice addressed by cursor (the polling-safe complement to
+/// the DRAINING `read-logs`). `data` is bytes (children emit non-UTF-8).
+record log-chunk {
+    data: list<u8>, next: log-cursor, bytes-dropped: u64, drained-eof: bool,
+}
+
+/// Non-draining status snapshot; unit of `list-processes` / `status`.
+record process-info {
+    id: process-id, label: string, command: string, os-pid: option<u32>,
+    phase: process-phase, exit: option<exit-info>, age-ms: u64, idle-ms: u64,
+    buffered-bytes: u64, bytes-dropped: u64, stdin-open: bool,
+}
+
+// `spawn-request` carries persistent-only fields (label, keep-stdin-open,
+// overflow, log-ring-bytes, max-lifetime-ms, idle-timeout-ms,
+// exit-retention-ms), honored only by `spawn-persistent` and ignored by the
+// ephemeral spawns. `error-code` additionally carries: no-such-process
+// (unknown / released / wrong-principal / wrong-capsule — indistinguishable,
+// no oracle), registry-full (retained-id cap), invalid-id (malformed, returned
+// without a lookup), persist-unsupported (host cannot keep a detached child
+// contained — e.g. macOS without the operator opt-in, or an owner-fallback
+// principal).
+
+/// Spawn a persistent background process. Gated on `host_process` AND the
+/// operator `allow_persistent` sub-grant. Counts against BOTH the per-principal
+/// concurrent cap (shared with `spawn-background`) AND a retained-id cap.
+/// Fail-closed refusals (`persist-unsupported`): owner-fallback principal
+/// (a persistent process needs an unambiguous owner); sandbox disabled; macOS
+/// without the operator persistence opt-in.
+spawn-persistent: func(request: spawn-request) -> result<process-id, error-code>;
+
+/// Re-materialise a `process-handle` over a persistent process for THIS
+/// invocation — the composition primitive (every ephemeral method works).
+/// DETACH-on-drop: dropping it (incl. on instance reset) does NOT reap.
+attach: func(id: process-id) -> result<process-handle, error-code>;
+
+/// List the caller `(capsule, principal)`'s persistent processes (label-filter
+/// optional). NEVER another principal's or capsule's. Empty is normal.
+list-processes: func(label-filter: option<string>) -> result<list<process-info>, error-code>;
+/// Non-draining status snapshot (the safe poll primitive). `status-many`
+/// batches for a supervisor polling N children (one lock pass, one audit row).
+status: func(id: process-id) -> result<process-info, error-code>;
+status-many: func(ids: list<process-id>) -> result<list<process-info>, error-code>;
+
+// id-keyed convenience fns — exact `attach(id)?.<method>()` sugar for
+// single-shot tool calls (one principal check, one error mapping):
+read-logs: func(id: process-id) -> result<read-logs-result, error-code>;   // DRAINS
+read-since: func(id: process-id, stream: log-stream, cursor: log-cursor, max-bytes: u32) -> result<log-chunk, error-code>;
+write-stdin: func(id: process-id, data: list<u8>) -> result<u32, error-code>;
+close-stdin: func(id: process-id) -> result<_, error-code>;
+signal: func(id: process-id, sig: process-signal) -> result<_, error-code>;
+wait: func(id: process-id, timeout-ms: u64) -> result<exit-info, error-code>; // bounded REQUIRED
+/// Graceful terminal: SIGTERM, grace, SIGKILL, drain, remove. (Immediate kill:
+/// `attach(id)?.kill()`.)
+stop: func(id: process-id, grace-ms: option<u64>) -> result<kill-result, error-code>;
+/// Free an EXITED process's retained id + log tail without signalling.
+release-process: func(id: process-id) -> result<_, error-code>;
+
+/// Arm DURABLE lifecycle events for `id`, published by the host UNDER THE
+/// CREATOR PRINCIPAL on `astrid.process.v1.{exited,log-ready,stdin-drained}.*`
+/// (a pollable cannot survive instance reset, so the durable channel is the bus
+/// the capsule already subscribes to). The `exited` payload carries a reason
+/// (self-exit / killed / reaped-ttl / reaped-shutdown) so a supervisor
+/// distinguishes a crash from a daemon-shutdown reap.
+watch: func(id: process-id, suffix: option<string>) -> result<_, error-code>;
+unwatch: func(id: process-id) -> result<_, error-code>;
+```
+
+**Identity is a capability, not a name.** A `process-id` is a 256-bit CSPRNG
+secret (host entropy, the same `astrid:sys random-bytes` source); the host
+stores a keyed hash and re-resolves the live `effective-principal` + `capsule`
+on **every** id-keyed call, comparing against the recorded creator *before*
+reading any field of the target entry. Wrong-owner / unknown / reaped all
+collapse to `no-such-process` (no existence oracle); `invalid-id` is returned
+without a registry lookup (timing-oracle defense). Unguessability is defense in
+depth — the per-call principal check is the boundary, so even a fully-leaked
+token (the shell returns the id in a tool message the LLM sees) is inert across
+principals. The **spawn boundary** is the real isolation risk, not attach:
+`effective-principal` falls back to the capsule owner when there is no
+authenticated caller, so `spawn-persistent` **refuses** the owner-fallback
+principal (else several tenants share a `default` namespace `list-processes`
+would enumerate).
+
+**Lifecycle.** A persistent process is principal-scoped authority that must not
+leak. It is reaped on the first of: explicit `stop`/`release-process`;
+`max-lifetime-ms` (omission means the host ceiling, never infinity — a guest
+cannot request unbounded life); `idle-timeout-ms`; child self-exit +
+`exit-retention-ms`; principal eviction; capsule full-unload (last instance,
+never an instance reset); host-pressure GC; daemon shutdown. **Never** on
+instance reset or `attach`-handle drop — that is the whole point. Two caps with
+distinct errors: a per-principal **concurrent** cap shared with
+`spawn-background` (`quota`) and a per-principal **retained-id** cap
+(`registry-full`), plus an aggregate per-principal log-buffer ceiling.
+
+**Sandbox lifetime.** Keeping a sandboxed child alive past the spawning instance
+needs no new spawn topology: the child is already spawned by the *daemon's*
+runtime, and only `kill_on_drop` + the handle's `Drop` reaps it on instance
+drop. Relocating ownership into the host registry before the instance resets
+moves that reap to registry teardown. On **Linux**, `bwrap`'s `--unshare-all` +
+`--die-with-parent` make it kernel-enforced even on a daemon `SIGKILL`. On
+**macOS**, Seatbelt has no PID namespace and no parent-death tie, so a child
+that escapes its process group is unreapable and a daemon `SIGKILL` leaks it —
+macOS persistence is therefore **materially weaker and fail-closed by default**
+(`persist-unsupported` unless the operator opts in). The registry is in-memory,
+so persistence does **not** survive a daemon restart (ids then resolve to
+`no-such-process`, and the recovery signal is an empty `list-processes`); a
+process the daemon can no longer see is one it cannot kill, audit, or attribute,
+so re-adoption across restart is deliberately out of scope. Every persistent op
+is audited (op + principal + capsule + a hash of the id; never the raw id, env,
+stdin, or log contents).
 
 ## Guest exports
 
@@ -565,7 +723,17 @@ Gating these would add friction without security benefit.
   size on `write-file`, max message size on `ipc-publish`, max KV value size)?
   Currently unbounded — a capsule can write arbitrarily large values.
 
-# Future possibilities
+- **Persistent-process `watch` publish authority.** The persistent tier's
+  `watch` has the host publish `astrid.process.v1.*` lifecycle events under the
+  creator principal. Does that need a manifest `[publish]` declaration, or is it
+  a distinct *kernel-authored* topic class the capsule only `[subscribe]`s to
+  (the host, not the capsule, is the authoritative publisher)? This ties to the
+  topic-grammar work. If unresolved, the fallback is to drop `watch` and have
+  supervisors poll `status`/`status-many` + a bounded `wait` — no new publish
+  authority, slightly less efficient. Related: the principal-eviction reap
+  chokepoint, whether `allow_persistent` is a distinct operator sub-grant vs
+  `host_process` alone, and whether macOS persistence ships behind the operator
+  opt-in with a best-effort reaper or is gated on a stronger macOS reaper first.
 [future-possibilities]: #future-possibilities
 
 - **Resource-typed caller-context.** Replace the payload-carried `principal`
