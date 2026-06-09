@@ -11,23 +11,23 @@ read-only, addressable *resources* (named blobs of context) over the bus, so
 they surface to MCP clients connected through `astrid mcp serve` as MCP
 `resources`. It is the structural parallel of the existing `tool` interface: an
 `astrid-bus:resource@1.0.0` package of typed payload records carried on a
-`resource.v1.*` topic family, served by handler-bound subscribers, fanned out
-for discovery and routed per-URI for reads. Resources are **fetchable, not
-events**: the operations are request/response *over* Astrid's pub/sub bus —
-`read` a routed 1:1 exchange, `describe` a 1→N scatter-gather the broker
-aggregates. They are pull-only, per-principal scoped, and never carry secrets.
+`resource.v1.*` topic family, served by handler-bound subscribers. **Discovery
+is a 1→N scatter-gather** (the broker broadcasts, every serving capsule replies
+on its own per-source topic, the broker drains a window and aggregates);
+**reads are a broadcast-with-self-filter** (every read-serving capsule receives
+the read, only the URI's owner replies). Resources are fetchable, pull-only,
+per-principal scoped, and never carry secrets.
 
-The wire shape is sized for the *complete* MCP resource model as of the
-2025-11-25 schema revision — multi-content reads (text/blob arrays), `title`,
-`size`, `annotations`, `icons`, `_meta`, and cursor pagination are all present
-in the records from 1.0, because a WIT record is not extensible and adding a
-field post-1.0 is a breaking change. The push-shaped primitives (`subscribe` /
-`resources/updated`) are **excluded by construction** — Astrid serves MCP
-passively and cannot push to a client — and resource *templates* and
-`completion/complete` are **deferred without precluding** (additive new topics,
-no change to the records defined here). This RFC reconciles every feature of the
-MCP resource surface explicitly; see the decision table in
-[Reference-level explanation].
+The records are sized for the *complete* MCP resource model as of the 2025-11-25
+schema revision — multi-content reads (text/blob arrays), `title`, `size`,
+`annotations`, `icons`, and `_meta` are all present from 1.0, because a WIT
+record is not extensible and adding a field post-1.0 is a breaking change. The
+push-shaped primitives (`subscribe` / `resources/updated`) are **excluded by
+construction** — Astrid serves MCP passively and cannot push to a client.
+Resource *templates* and `completion/complete` are **deferred without
+precluding** (additive new topics). Pagination ships as **single-page in 1.0**
+(the realistic resource cardinality is tiny); the cursor is a broker↔client
+concern only and never reaches a capsule.
 
 # Motivation
 [motivation]: #motivation
@@ -50,10 +50,10 @@ Four properties drive the design:
 1. **Fetchable, not fire-and-forget.** Listing and reading are request/response
    operations — *interceptors*, in Astrid terms: a `[subscribe]` entry bound to a
    `handler` that replies, realized over the pub/sub bus as a request topic
-   answered on a correlation-keyed response topic. `read` is a routed 1:1
-   request/response; `describe` is a 1→N scatter-gather the broker fans out and
-   aggregates (multiple capsules can serve resources). Resources are *fetched* on
-   demand, not broadcast as events.
+   answered on a response topic. `describe` is a 1→N scatter-gather (the broker
+   drains every serving capsule's reply); `read` is a broadcast where only the
+   owning capsule answers. Resources are *fetched* on demand, not broadcast as
+   events.
 2. **Served by capsules, discovered by the broker.** Resources populate
    *automatically* from whatever capsules can serve them — the same fan-out the
    tool surface already uses. The broker stays a dumb aggregator; it never holds
@@ -65,42 +65,44 @@ Four properties drive the design:
    Standardizing the contract is what lets any capsule expose governed,
    re-readable context with no change to the broker or the shim.
 4. **1.0-safe against the full MCP model.** WIT records are immutable once
-   published; a missing field is a future breaking change. So the records must
-   carry the entire MCP `Resource`/`ResourceContents` shape now — even fields the
-   reference shim cannot surface today — and every deferred feature must be
-   addable as a *new* topic or record, never as a field on an existing one.
+   published; a missing field is a future breaking change. So the records carry
+   the entire MCP `Resource`/`ResourceContents` shape now — even fields the
+   reference shim cannot surface today — and every deferred feature is addable as
+   a *new* topic or record, never as a field on an existing one.
 
 # Guide-level explanation
 [guide-level-explanation]: #guide-level-explanation
 
 A **resource** is a named, addressable, read-only blob of context: a `uri`
 (conventionally `astrid://…`), a programmatic `name` and optional human `title`,
-an optional `description`, declared `mime-type`, `size`, client `annotations`
-(audience / priority / last-modified), `icons`, and a `_meta` extensibility
-escape hatch. A capsule that holds context worth reading *exports the resource
-interface*: it answers "what resources do you serve?" and "read this URI."
+an optional `description`, declared `mime-type`, `size`, client `annotations`,
+`icons`, and a `_meta` escape hatch. A capsule that holds context worth reading
+*exports the resource interface*: it answers "what resources do you serve?" and
+"read this URI."
 
-There are two operations, mirroring the tool interface's describe/execute:
+Two operations, mirroring the tool interface's describe/execute:
 
-- **describe** — enumerate. A *fan-out*: the broker asks every resource-serving
-  capsule for its list and aggregates the responses. Cursor-paginated.
-- **read** — fetch one URI. *Routed* to the capsule that owns the URI. A read
+- **describe** — enumerate. A *fan-out*: the broker broadcasts one request; every
+  serving capsule replies on its own `…response.describe.<source-id>` topic; the
+  broker drains a bounded window and aggregates. The invoking principal rides the
+  **envelope** (kernel-stamped), not the payload.
+- **read** — fetch one URI. There is no source-id-targeted publish on the bus, so
+  the read is **broadcast** on a single topic; every read-serving capsule
+  receives it, **only the URI's owner replies**, non-owners stay silent. A read
   returns a **list** of content chunks (text or blob), because one logical URI
   may expand into sub-resources and the chunks may mix types.
 
 ```
-  MCP client            astrid mcp serve            broker (sage-mcp)         serving capsule
+  MCP client            astrid mcp serve            broker (sage-mcp)         serving capsules
       │  resources/list        │                          │                         │
-      ├───────────────────────►│  mcp.resources.list      │                         │
-      │                        ├─────────────────────────►│  resource.v1.request.   │
-      │                        │                          │      describe (fan-out) │
-      │                        │                          ├────────────────────────►│
-      │                        │                          │◄─ describe.<corr-id> ───┤
-      │◄── list + nextCursor ──┤◄─ aggregated, uri-sorted ┤                         │
-      │                        │                          │                         │
-      │  resources/read <uri>  │  mcp.resource.read       │  resource.v1.request.   │
-      ├───────────────────────►├─────────────────────────►│      read → owning src  │
-      │◄─ contents[] (txt|blob)┤◄──── read-response ──────┤◄─ response.<corr-id> ───┤
+      ├───────────────────────►│  mcp.resources.list      │   describe (broadcast)  │
+      │                        ├─────────────────────────►├────────────────────────►│ (each replies on
+      │                        │                          │◄ …describe.<source-id> ─┤  its own source topic)
+      │◄──── list (1 page) ────┤◄ drained, per-principal ─┤                         │
+      │                        │   filtered, deduped      │                         │
+      │  resources/read <uri>  │  mcp.resource.read       │   read (broadcast)      │
+      ├───────────────────────►├─────────────────────────►├────────────────────────►│ owner replies;
+      │◄─ contents[] (txt|blob)┤◄── read-response ────────┤◄ …read.<correlation-id>─┤ non-owners silent
 ```
 
 A serving capsule declares the contract in its `Capsule.toml`, exactly as a tool
@@ -117,19 +119,17 @@ capsule declares `tool.v1.*`:
 ```
 
 From the client's side, `astrid mcp serve` advertises the `resources` capability
-at `initialize` (with `subscribe: false`, `listChanged: true`); `resources/list`
-and `resources/read` map onto the broker front doors. The client lists and reads
-on demand. **Nothing is pushed** — there is no resource-change subscription, only
-the same best-effort `list_changed` notification the tool surface already emits
-when capsules load or unload.
+at `initialize` (`subscribe: false`, `listChanged: true`); `resources/list` and
+`resources/read` map onto the broker front doors. The client lists and reads on
+demand. **Nothing is pushed** — only the best-effort `list_changed` notification
+the shim emits when the resource surface changes (capsule load/unload).
 
-Worked example: a small introspection capsule serves `astrid://capabilities`
-(the invoking principal's held grants) and `astrid://budget` (its CPU-fuel and
-memory usage vs. limits). On `describe` it returns both definitions; on
-`read("astrid://capabilities")` it returns a one-item `contents` list — a `text`
-chunk of the live grant list for *that principal only*. The broker never learns
-what the resource means — it discovers the URIs, routes the read, and forwards
-the chunks.
+Worked example: an introspection capsule serves `astrid://capabilities` and
+`astrid://budget`. On `describe` it returns both definitions, scoped to the
+principal on the envelope. On `read("astrid://capabilities")` it returns a
+one-item `contents` list — a `text` chunk of the live grant list for *that
+principal only*. The broker never learns what the resource means — it discovers
+the URIs, routes the read by broadcast-and-self-filter, and forwards the chunks.
 
 # Reference-level explanation
 [reference-level-explanation]: #reference-level-explanation
@@ -137,9 +137,8 @@ the chunks.
 ## Shared types (`astrid-bus:types`)
 
 `resource-definition` and the content types live in the shared `types` package
-alongside `tool-definition`, since the broker and the shim both depend on them.
-Every field past `name`/`uri` is optional (or an empty-able `list`), so a capsule
-emits the minimum and the contract stays forward-compatible.
+alongside `tool-definition`. Every field past `name`/`uri` is optional (or an
+empty-able `list`), so a capsule emits the minimum and stays forward-compatible.
 
 ```wit
 /// A resource a capsule exposes for reading. Mirrors the MCP `Resource`
@@ -155,28 +154,28 @@ record resource-definition {
     description: option<string>,
     /// Declared MIME type of the resource, if uniform and known.
     mime-type: option<string>,
-    /// Raw content size in bytes (pre-base64), if known. For context-window
-    /// estimation and file-size display.
-    size: option<u64>,
+    /// Raw content size in bytes (pre-base64), if known. `u32` to round-trip
+    /// rmcp's `RawResource.size: Option<u32>` losslessly (≤ 4 GiB).
+    size: option<u32>,
     /// Optional client hints (audience / priority / last-modified).
     annotations: option<annotations>,
     /// Sized icons for UI display. Empty list = none.
     icons: list<icon>,
     /// Extensibility escape hatch — a JSON object encoded as a string (as with
     /// `tool-call.arguments`). Maps to MCP `_meta`; key-namespacing rules apply
-    /// (see Semantics).
+    /// (see Semantics → `_meta`).
     meta: option<string>,
 }
 
 /// Optional client display/usage hints. Mirrors MCP `Annotations`; these three
-/// fields are the complete set the MCP layer can round-trip.
+/// fields are the complete set rmcp 1.7.0 round-trips (`#[non_exhaustive]`).
 record annotations {
     /// Intended audience(s). Empty = unspecified.
     audience: list<resource-role>,
-    /// Importance in the inclusive range 0.0..=1.0 (1 = effectively required,
-    /// 0 = entirely optional). Out-of-range values are clamped by the shim.
+    /// Importance in the inclusive range 0.0..=1.0. Out-of-range → clamped by the shim.
     priority: option<f32>,
-    /// Last-modified moment as an ISO-8601 string, e.g. "2025-01-12T15:00:58Z".
+    /// Last-modified as an ISO-8601 string, e.g. "2025-01-12T15:00:58Z". The shim
+    /// parses to `DateTime<Utc>`; a malformed value drops ONLY this field.
     last-modified: option<string>,
 }
 
@@ -184,13 +183,9 @@ enum resource-role { user, assistant }
 
 /// A sized icon for UI display. Mirrors MCP `Icon` (2025-11-25).
 record icon {
-    /// HTTP(S) URL or `data:` URI to the icon. RFC 3986.
     src: string,
-    /// MIME type override, e.g. "image/png", "image/svg+xml".
     mime-type: option<string>,
-    /// Sizes the icon serves, "WxH" (e.g. "48x48") or "any". Empty = unspecified.
     sizes: list<string>,
-    /// Theme the icon targets.
     theme: option<icon-theme>,
 }
 
@@ -198,8 +193,7 @@ enum icon-theme { light, dark }
 
 /// One chunk of a resource read. Discriminated text vs blob, mirroring the MCP
 /// `TextResourceContents` / `BlobResourceContents` split (rmcp's untagged enum).
-/// A single read returns a `list` of these: a resource may expand into
-/// sub-resources, and chunks may mix text and blob.
+/// A single read returns a `list` of these.
 variant resource-contents {
     text(resource-text),
     blob(resource-blob),
@@ -208,11 +202,10 @@ variant resource-contents {
 record resource-text {
     /// URI of this (sub-)resource — may differ from the requested URI.
     uri: string,
-    /// Declared MIME type of this chunk, if known.
     mime-type: option<string>,
     /// UTF-8 text payload.
     text: string,
-    /// Per-chunk `_meta` (MCP carries `_meta` on each contents item).
+    /// Per-chunk `_meta`.
     meta: option<string>,
 }
 
@@ -227,65 +220,69 @@ record resource-blob {
 
 ## Interface (`astrid-bus:resource@1.0.0`)
 
+The capsule-facing records carry **no correlation-id on `describe`** and **no
+cursor anywhere** — both were errors in an earlier draft. `describe` attributes
+replies by the kernel-stamped **source-id** of each per-source response topic
+(this is how the live `tool.v1` fan-out actually works — `tool.wit`'s
+`correlation-id` field is vestigial, unused by the broker). `read` carries a
+`correlation-id` because it is a genuine per-request exchange (the broker mints
+one to tell concurrent reads apart). Pagination is a broker↔client concern that
+never reaches a capsule, so the cursor appears in neither record (see Pagination).
+
 ```wit
 package astrid-bus:resource@1.0.0;
 
 /// Resource interface — capsules serve read-only, addressable context.
 ///
-/// A capsule exporting this interface answers `resource.v1.request.describe`
-/// (enumerate, fan-out, cursor-paginated) and `resource.v1.request.read` (fetch
-/// one URI, routed to the owning capsule, multi-content), replying on
-/// `resource.v1.response.{describe,read}.<correlation-id>`. Resources are
-/// fetchable, pull-only, per-principal scoped, and never carry secrets.
+/// `describe` (`resource.v1.request.describe`) is a fan-out: the broker
+/// broadcasts an empty request and each capsule replies on its own
+/// `resource.v1.response.describe.<source-id>` topic; the broker drains the
+/// `…describe.*` wildcard and attributes by source-id. `read`
+/// (`resource.v1.request.read`) is a broadcast where only the URI's owner
+/// replies, on `resource.v1.response.read.<correlation-id>`. Resources are
+/// pull-only, per-principal scoped, and never carry secrets.
 interface resource {
     use astrid-bus:types/types.{resource-definition, resource-contents};
 
-    /// Ask a resource-providing capsule to enumerate its resources.
-    /// Topic: `resource.v1.request.describe` (fan-out). Every responder returns
-    /// its list scoped to the invoking principal.
+    /// Ask resource-providing capsules to enumerate their resources.
+    /// Topic: `resource.v1.request.describe` (broadcast). The payload is EMPTY —
+    /// the invoking principal rides the kernel-stamped envelope, not the body.
+    /// Each capsule MUST scope its reply to that principal (see Semantics).
     record describe-request {
-        /// The capsule replies on `resource.v1.response.describe.<correlation-id>`.
-        correlation-id: string,
-        /// Opaque pagination position. None = first page. Cursors are
-        /// broker-minted and opaque; a capsule receiving one it did not mint
-        /// MUST ignore it and return its full list (see Pagination).
-        cursor: option<string>,
+        // intentionally empty; reserved for future request-scoping fields.
     }
 
     /// The resources a capsule provides.
-    /// Topic: `resource.v1.response.describe.<correlation-id>`.
+    /// Topic: `resource.v1.response.describe.<source-id>`.
     record describe-response {
-        correlation-id: string,
         resources: list<resource-definition>,
-        /// Opaque continuation token. None = this capsule returned everything.
-        /// The broker reconciles per-capsule cursors into one client cursor.
-        next-cursor: option<string>,
     }
 
     /// Read one resource by URI.
-    /// Topic: `resource.v1.request.read`. The broker routes it to the capsule
-    /// that owns the URI (from the describe snapshot).
+    /// Topic: `resource.v1.request.read` (broadcast). Only the URI's owner
+    /// replies; non-owners stay silent (do NOT reply with an error).
     record read-request {
         uri: string,
+        /// Broker-minted; the owner echoes it in the reply topic
+        /// `resource.v1.response.read.<correlation-id>` so concurrent reads
+        /// stay distinct.
         correlation-id: string,
     }
 
     /// Contents of a read.
     /// Topic: `resource.v1.response.read.<correlation-id>`.
     ///
-    /// `contents` is a LIST: one logical URI may expand into sub-resources, and
-    /// chunks may mix text and blob. On failure, `contents` is empty and `error`
-    /// carries a human-readable reason (unknown URI, denied, unavailable).
+    /// `contents` is a LIST: one URI may expand into sub-resources, chunks may
+    /// mix text and blob. On failure `contents` is empty and `error` is set.
     record read-response {
-        correlation-id: string,
         /// Echoes the requested URI.
         uri: string,
         contents: list<resource-contents>,
-        /// Present iff the read failed. Mutually exclusive with non-empty `contents`.
+        /// Present iff the read failed; mutually exclusive with non-empty `contents`.
         error: option<string>,
-        /// Reserved for result-level MCP `_meta`. Unsurfaced today (the reference
-        /// rmcp pin has no slot); present so the read path is symmetric with the
-        /// list path and a future pin needs no breaking record change.
+        /// Reserved for result-level MCP `_meta`. Unsurfaced today (rmcp 1.7.0's
+        /// `ReadResourceResult` has no slot); present so a future pin needs no
+        /// breaking record change.
         meta: option<string>,
     }
 }
@@ -295,276 +292,353 @@ interface resource {
 
 | Topic | Direction | Payload |
 |-------|-----------|---------|
-| `resource.v1.request.describe` | broker → serving capsules (fan-out) | `describe-request` |
-| `resource.v1.response.describe.<correlation-id>` | serving capsule → broker | `describe-response` |
-| `resource.v1.request.read` | broker → owning capsule (routed) | `read-request` |
+| `resource.v1.request.describe` | broker → serving capsules (broadcast) | `describe-request` (empty) |
+| `resource.v1.response.describe.<source-id>` | serving capsule → broker | `describe-response` |
+| `resource.v1.request.read` | broker → read-serving capsules (broadcast) | `read-request` |
 | `resource.v1.response.read.<correlation-id>` | owning capsule → broker | `read-response` |
 
-Discovery mirrors `tool.v1.request.describe`: the broker subscribes to the
-response pattern, publishes one `describe-request` with a fresh `correlation-id`,
-drains responses for a bounded window, aggregates, and dedupes by `uri` (first
-responder wins; a collision is logged). The kernel-stamped `source-id` on each
-response envelope identifies the owning capsule, so the broker builds a
-`uri → source-id` routing table from the snapshot. A `read` for a URI not in the
-table triggers a re-describe before failing.
+**Describe (fan-out).** The broker subscribes to `resource.v1.response.describe.*`,
+publishes one empty `describe-request`, and drains a bounded window. Each capsule
+replies on `…describe.<source-id>` (its kernel-stamped source-id); the broker
+attributes each reply by that source-id segment. This is the live `tool.v1`
+mechanism verbatim. At most **one** response per source-id is honoured per round
+(a second is dropped and logged); a full re-describe — not an incremental
+broadcast — is what evicts a removed URI from the snapshot.
 
-**Discovery is a 1→N scatter-gather, and the drain is the requester's job.** One
-request, one shared `correlation-id`, and every serving capsule replies on the
-same `…response.describe.<correlation-id>` topic; the broker tells the replies
-apart by their `source-id`. A serving capsule implements only its
-`resource_describe` handler — return its list (scoped to the principal), echo the
-`correlation-id` — and **never drains or aggregates**. The collection
-(subscribe-before-publish, drain the window, dedupe, sort, paginate) lives once,
-on the requester side; capsules do not hand-roll it. The 1:1 `read` is the
-degenerate case — a drain window that stops at the first reply, i.e.
-`ipc::request_response`.
+**Read (broadcast + self-filter).** The bus has only topic-keyed publish
+(`publish`/`publish_as`) — there is no source-id-targeted send, so the broker
+*cannot* deliver a read to only the owner. The read is broadcast on the single
+`resource.v1.request.read` topic; every read-serving capsule receives it and
+**self-filters by URI**; only the owner replies (on `…read.<correlation-id>`);
+non-owners stay silent so the broker knows the owner answered when it gets one
+non-empty reply. The describe-derived `uri → source-id` map is a
+**disambiguation hint** (for logging/audit), not a routing primitive.
 
-Because the responder count is unknown (capsule topology is open) and the window
-is bounded, **`describe` is best-effort**: the aggregate is *every resource from
-every capsule that answered within the window*, not a hard completeness
-guarantee. A capsule that misses the window is absent from that round and
-reappears on the next `describe` — driven by a `list_changed` nudge (capsule
-load/unload) or a re-describe on a read miss. Eventual consistency, not snapshot
-consistency.
+**Dedup + collision.** On a `uri` collision across capsules, the broker keeps the
+entry whose **source-id sorts lexicographically first** — a *deterministic*
+tie-break independent of bus arrival order — and logs a collision audit. (See
+Capability for the trust model around collisions.) The aggregated snapshot MUST
+carry each entry's source-id so this is constructible.
 
 **Reserved for templates (additive, not defined here).** Resource *templates*
-(below, Future possibilities) get their own topic family
-`resource.v1.request.describe-templates` /
-`resource.v1.response.describe-templates.<correlation-id>` carrying a future
-`resource-template` record (a `uri-template` field per RFC 6570). They are a
-*new* topic and record — adding them changes nothing in the records defined
-here. The name is reserved now to keep the eventual addition unambiguous.
+get their own topic family `resource.v1.request.describe-templates` /
+`resource.v1.response.describe-templates.<source-id>` carrying a future
+`resource-template` record (`uri-template` per RFC 6570). Adding them changes
+nothing in the records here.
 
 ## MCP bridge (broker front doors)
 
-The `sage-mcp` broker exposes two front doors the `mcp serve` shim calls,
-parallel to the existing `astrid.v1.request.mcp.tools.list` / `…tool.call`:
-
 | Front door | Gating | Behaviour |
 |------------|--------|-----------|
-| `astrid.v1.request.mcp.resources.list` | ungated (read-only discovery, as with `tools.list`) | fan out `describe`, aggregate, sort by `uri`, page, reply with `nextCursor` |
-| `astrid.v1.request.mcp.resource.read` | confused-deputy `trusted_ingress` gate (as with `tool.call`) | route the read to the owning capsule, reply |
+| `astrid.v1.request.mcp.resources.list` | **ungated** — but *only* because describe is per-principal-scoped (below); that scoping is load-bearing for list's safety | fan out describe, **filter to the invoking principal**, dedupe, sort by `uri`, reply one page |
+| `astrid.v1.request.mcp.resource.read` | confused-deputy gate, at the fidelity of `tool.call`: resolve `runtime::caller()`, **fail closed on no caller context**, require `source_id ∈ trusted_ingress_ids` (a `trusted_ingress` membership, **not** merely `verified()`), reply error + empty on rejection (never dispatch) | broadcast the read, collect the owner's reply, reshape |
+
+The read reply travels back to the shim on the standard
+`astrid.v1.response.<req_id>` envelope. Its JSON carries an explicit
+`type: "text" | "blob"` discriminant per content chunk — the broker needs a new
+content-shaping path; the tool surface's text-only `mcp_content` cannot be reused.
 
 ## MCP shim (`astrid mcp serve`)
 
-- `get_info` adds the `resources` capability. The builder ordering is
-  load-bearing: call `enable_resources()` **before** `enable_resources_list_changed()`
-  (the list-changed setter no-ops if `resources` is unset), and **do not** call
-  the subscribe setter — leaving `subscribe` unset serializes as absent, which a
-  client reads as `false`.
-- `list_resources` → `astrid.v1.request.mcp.resources.list`, reshape the
-  aggregated definitions to MCP `ListResourcesResult`. Honors the MCP
-  `cursor`/`nextCursor`: the broker mints an opaque client cursor over the
-  aggregated, `uri`-sorted snapshot; v1 returns a single page (`nextCursor`
-  absent — see Pagination).
+- `get_info` sets the `resources` capability by **field mutation**, mirroring the
+  existing `capabilities.tools = …`:
+  `capabilities.resources = Some(ResourcesCapability { subscribe: None, list_changed: Some(true) })`.
+  Leaving `subscribe` unset serializes absent, which a client reads as `false`.
+- **Advertising `resources` REQUIRES overriding `read_resource`** — rmcp 1.7.0's
+  default `read_resource` returns `method_not_found`, so a listable surface with
+  an unwired read 404s every read. (`list_resources` must also be overridden; the
+  default is empty-OK.)
+- `list_resources` → `astrid.v1.request.mcp.resources.list`, reshape to MCP
+  `ListResourcesResult`. Single page in 1.0 (`nextCursor` absent — see Pagination).
 - `read_resource(uri)` → `astrid.v1.request.mcp.resource.read`. Reshape
   `read-response.contents` to `ReadResourceResult.contents` (a `Vec`), mapping
   each `resource-contents::text` → `TextResourceContents` and `::blob` →
-  `BlobResourceContents`. The discriminant is the WIT variant arm — never
-  inferred from `mime-type`.
-- `notifications/resources/list_changed` reuses the existing `capsules_loaded`
-  broadcast — the same nudge that already drives `tools/list_changed`. This is
-  the *one* server → client signal Astrid has, and it is **list-granularity**
-  (capsule load/unload), not a per-resource update.
+  `BlobResourceContents`. The discriminant is the WIT variant arm — never inferred
+  from `mime-type`. `ReadResourceResult` has **no `isError`**; a read failure is a
+  JSON-RPC error (see Semantics → Errors), never an empty-contents success.
+- `resources/templates/list` falls through to rmcp's default **empty-OK**
+  (`{resourceTemplates: []}`) — the intentional, conformant representation of
+  "templates deferred."
+- `notifications/resources/list_changed` requires an **independent
+  resource-URI-set baseline** in the shim's watcher, diffed on `capsules_loaded`
+  and pushed when the resource set changes. The existing watcher diffs *tool*
+  names only; a resource-only change would otherwise be suppressed. The two diffs
+  are independent (a reload may change tools, resources, both, or neither).
+- **Reshape table (WIT → rmcp):** `size: option<u32>` → `RawResource.size`
+  (lossless); `annotations` → the `Annotated<RawResource>` *wrapper* (not a
+  `RawResource` field); `last-modified` (ISO-8601 string) → `DateTime<Utc>`,
+  dropping only `last-modified` on a parse failure; `priority` clamped to `[0,1]`;
+  `meta` (JSON string) → the rmcp `_meta` map.
 
 ## Semantics
 
-- **Per-principal, always.** Every `describe` and `read` carries the invoking
-  principal (kernel-stamped `source-id → principal`). A serving capsule MUST
-  scope both the returned definitions and the read contents to that principal. A
-  read addressing another principal's URI MUST fail closed (`error` set,
-  `contents` empty).
-- **Never a secret.** A serving capsule MUST NOT expose secret material —
-  credentials, tokens, key bytes — as a resource. Resources are non-sensitive
-  context by contract.
-- **Read-through.** A `read` reflects live state at read time. The broker MAY
-  cache the *describe* snapshot with a TTL (as it does for tools); it MUST NOT
-  cache `read` contents.
-- **Gating.** Discovery (`list`) is ungated. Reads pass the broker's
-  confused-deputy ingress allow-set, identical to tool execution — a read can
-  touch per-principal state, so it is gated like an action.
-- **Errors.** Unknown URI, denied, or unavailable → `read-response.error` set
-  with a human-readable reason and `contents` empty. A broker-side drain timeout
-  surfaces as a JSON-RPC error to the client.
-- **`_meta` namespacing.** A capsule populating `meta` (on a definition or a
-  content chunk) MUST namespace its keys under `com.unicity-astrid/` (or another
-  domain it controls). The second-label prefixes `mcp` and `modelcontextprotocol`
-  are reserved by MCP and MUST NOT be used.
-- **Annotation bounds.** `annotations.priority`, if present, is in `[0.0, 1.0]`;
-  the shim clamps out-of-range values. `last-modified` is an ISO-8601 string.
-- **Concurrency.** A fresh `correlation-id` scopes every request's responses, so
-  concurrent describes and reads never collide on a response topic.
+- **Per-principal, and the broker MUST enforce it — it is not free.** The bus
+  self-scope fires only for the *audit* topic (`pattern_covers_audit`); an
+  ordinary subscription like `resource.v1.response.describe.*` is unscoped, so a
+  concurrent describe for principal B can land B-scoped replies in A's drain. The
+  broker therefore MUST filter every drained describe-response to the invoking
+  principal (drop any whose kernel-stamped principal ≠ the invoker), and the
+  serving capsule MUST scope its own reply. Do **not** rely on the implicit bus
+  self-scope.
+- **The serving capsule MUST derive the principal from the kernel attribution**
+  (`caller().principal` / `Verified`), MUST NOT read it from any request-body
+  field, and MUST fail closed when it is absent or `Claimed`. This is
+  capsule-untrusted-input territory: the records deliberately carry no principal
+  field. The `#[astrid::resource]` macro (Future possibilities) SHOULD inject a
+  Verified-principal-or-fail-closed prologue so the common case is correct by
+  construction.
+- **Any broker-side describe-snapshot cache, and the `uri → source-id` map
+  derived from it, MUST be keyed by invoking principal.** A cache hit for
+  principal B MUST NOT serve principal A's snapshot. The existing tool cache's
+  single global key (`tools.cache`) is **not** a safe template — for tools the
+  descriptors are principal-uniform; for resources the per-principal scoping is
+  the entire premise, so a shared cache leaks exactly the payload the design
+  protects. (Re-fanning-out per principal is also acceptable, and simplest.)
+- **Never a secret.** A serving capsule MUST NOT expose secret material as a
+  resource. Resources are non-sensitive context by contract.
+- **Resource content is not inherently trusted.** A capsule may serve external,
+  attacker-influenced data; the broker does not vet content; an
+  `annotations.priority` near 1.0 does not make content authoritative. A capsule
+  serving external data assumes the injection responsibility. (Provenance is not
+  a 1.0 record field; if one is later wanted it rides a reserved
+  `com.unicity-astrid/provenance` `_meta` key — additive.)
+- **Shapes are implicit.** A capsule MAY answer reads for a URI *family* it owns
+  (e.g. `astrid://logs/<id>`) without enumerating every member in `describe`;
+  describe is a discovery hint, **not** a mandatory exhaustive read-allowlist.
+  URIs are flat: there is **no implicit hierarchy or `..` traversal** — owning
+  `astrid://logs/` grants no authority over `astrid://capabilities`, and a capsule
+  MUST reject a read outside the family it actually serves (fail closed). A
+  capsule that *wants* a closed allowlist MAY enforce describe-membership; that is
+  its choice, not a contract requirement.
+- **Gating.** Discovery (`list`) is ungated *because* its results are
+  per-principal-scoped. Reads pass the confused-deputy gate (MCP bridge table).
+- **Errors.** Every read failure is a JSON-RPC error, never an empty-contents
+  success: unknown URI → `-32002` (resource-not-found), denied / fail-closed →
+  `-32603`, broker drain timeout → `-32603`, each carrying `read-response.error`
+  as the message.
+- **`_meta` namespacing — enforced at the shim.** A capsule MUST namespace `meta`
+  keys under a domain it controls (`com.unicity-astrid/`, `dev.astrid/`); the
+  second labels `mcp` / `modelcontextprotocol` are MCP-reserved. The **shim**
+  (the one trusted choke before the client) MUST strip/reject reserved-prefixed
+  `_meta` keys, clamp `priority` to `[0,1]`, and cap `meta` byte size — the broker
+  is content-blind and cannot.
+- **Concurrency.** Concurrent describes are isolated by the **per-principal drain
+  filter** above (not by a correlation-id, which describe does not carry).
+  Concurrent reads are distinguished by the broker-minted `correlation-id` in the
+  read reply topic.
 - **No subscriptions.** The contract defines no resource-change subscription;
   `list_changed` is a coarse capability nudge, not a per-resource signal.
 
+## Limits
+
+Resource payloads are strictly larger than tool descriptors (unbounded text/blob)
+and the tool path bounds every axis the hard way; the resource contract MUST
+mirror it. Normative caps (values track `discovery.rs`/`cache.rs`):
+
+- `MAX_RESOURCES_PER_DESCRIBE_RESPONSE` (≈ 256) and `MAX_CACHED_RESOURCES` (≈ 512);
+  an over-cap describe-response is dropped + logged.
+- Per-field byte caps: `description`/`title` (≈ 4096), `meta` (bounded), max icons
+  per definition.
+- `MAX_CONTENTS_PER_READ` and a hard per-read aggregate byte cap, **base64 counted
+  pre-expansion**. An over-cap read **fails closed** (`error` set, `contents`
+  empty) — never silent truncation.
+
 ## Pagination
 
-MCP's client sees **one** `resources/list` with **one** opaque `cursor` /
-`nextCursor`. Astrid's describe is a **fan-out**: N capsules, each returning its
-own list. The reconciliation:
+MCP `resources/list` is cursor-paginated; Astrid's describe is a fan-out across N
+capsules with no per-capsule pagination. The reconciliation, and why 1.0 is
+single-page:
 
-The broker fans out `describe`, drains the window, aggregates all definitions,
-and **sorts by `uri`** (a total, stable order). It returns a page and mints an
-**opaque** client cursor encoding `{snapshot-id, last-uri}` (base64). On the next
-`resources/list` with that cursor, the broker resumes from its TTL'd snapshot
-after `last-uri`. Because MCP guarantees the cursor is opaque to the client and
-the server owns its encoding, the per-capsule `next-cursor` is an *internal*
-concern the broker hides; the `cursor`/`next-cursor` fields on the WIT records
-exist so that a future capsule with a large resource set can paginate its own
-contribution (the broker forwards the client cursor's per-capsule component and
-stitches the per-capsule `next-cursor`s back) — non-breaking precisely because
-the fields are present from 1.0.
+**Single-page in 1.0.** The broker fans out describe, filters to the principal,
+dedupes, sorts by `uri`, and returns **everything in one page** (`nextCursor`
+absent). The realistic resource cardinality is tiny (a handful per capsule), so
+windowing is not needed; the WIT carries **no cursor in any capsule-facing
+record** (the per-capsule cursor stitching a prior draft imagined is mechanically
+impossible over a single broadcast payload). The cursor exists only at the
+broker↔client (MCP) boundary, and in 1.0 the broker never mints one.
 
-**v1 behavior:** the broker aggregates everything and returns a single page
-(`nextCursor` absent). Enabling windowing later is a **broker-only** change — the
-wire shape already paginates. A cursor that outlives its snapshot degrades safely
-to a fresh first page, exactly MCP's "cursor may be invalid" allowance. Templates
-paginate identically when added.
+**Windowing is NOT a "broker-only change over the existing shape."** It would
+require new immutable snapshot retention the current cache cannot express: the
+live describe cache is a single mutable map, wholesale-replaced each fan-out and
+mutated outside any window by the standing collector, so it cannot freeze a
+stable page-set behind a cursor. If windowing is ever built, it needs a separate
+immutable per-`(principal, snapshot-id)` store with its own TTL, the cursor
+encoded as `{snapshot-id, last-index}`, **no re-describe between pages of one
+cursor chain**, and a stale/unknown cursor that terminates (empty page or
+`-32602` invalid-cursor) rather than silently restarting at page 1. This is the
+*B* option, and it is deferred: the resource cardinality does not motivate it.
+
+**Best-effort, stated honestly.** Because the describe window is bounded and the
+responder count is unknown, a single page is "every resource from every capsule
+that answered within the window." A capsule that misses the window is absent from
+that round and reappears on the next `describe` (a `list_changed` nudge or a
+re-describe-on-read-miss closes the gap). This is eventual, not snapshot,
+consistency — and it is *compatible* with single-page (there is no mid-iteration
+completeness promise to break, precisely because there is no iteration in 1.0).
 
 ## Shim coverage (rmcp 1.7.0)
 
 The *contract* (what the WIT carries) is distinct from what `astrid mcp serve`
-emits on the reference rmcp pin (1.7.0). rmcp is broadly spec-current, with two
-edges the RFC calls out so implementers do not chase phantom fields:
+emits on the reference rmcp pin. Verified against the pinned 1.7.0 source:
 
-- **Read result has no result-level `_meta` and no cursor.** rmcp's
-  `ReadResourceResult` is `{ contents: Vec<ResourceContents> }`. So
-  `read-response.meta` is **reserved-but-unsurfaced** today (left `none`); per-
-  chunk `meta` on `resource-text`/`resource-blob` *is* surfaced (rmcp's contents
-  carry `_meta`). Read is non-paginated by design — correct, the read records
-  carry no cursor.
-- **`Annotations` is `#[non_exhaustive]` with exactly `audience` / `priority` /
-  `lastModified`.** The WIT `annotations` mirrors precisely these three; future
-  annotation fields ride `meta`, not new typed fields.
+- **`ReadResourceResult` is `{ contents: Vec<ResourceContents> }` — no
+  result-level `_meta`, no `isError`, no cursor.** So `read-response.meta` is
+  reserved-but-unsurfaced (left `none`); read failures are JSON-RPC errors; per-
+  chunk `meta` *is* surfaced (rmcp's `ResourceContents` carry it). Read is
+  non-paginated — correct, the read records carry no cursor.
+- **`RawResource.size: Option<u32>`** — the WIT `size: option<u32>` round-trips
+  losslessly.
+- **`Annotations` (`#[non_exhaustive]`) = `audience` / `priority` /
+  `last_modified: Option<DateTime<Utc>>`.** The WIT mirrors exactly these three;
+  future annotation fields ride `meta`.
+- **Default handlers:** `read_resource`/`subscribe`/`unsubscribe` →
+  `method_not_found`; `list_resources`/`list_resource_templates` → empty-OK. So
+  the shim MUST override `read_resource` and `list_resources`; the
+  templates-empty-OK default is the conformant "deferred" representation.
 
-Everything else the contract carries — multi-content, `title`, `size`, `icons`,
-per-chunk `mime-type`/`meta`, and the paginated shape — is surfaceable on rmcp
-1.7.0 today. The shim builds rmcp's `#[non_exhaustive]` params/results via their
-constructors (not struct literals) and tolerates rmcp fields it does not set.
+Everything else the contract carries — multi-content, `title`, `icons`, per-chunk
+`mime-type`/`meta` — is surfaceable on 1.7.0 today.
+
+## Conformance tests
+
+The RFC mandates two test families so the assumptions are *guarded*, not merely
+checked once:
+
+**rmcp-shape guards (in the shim crate, compile against the pinned rmcp).** A
+future rmcp bump that changes these MUST break a test, not silently drift:
+- `RawResource.size` accepts the WIT `u32` (a type-level assertion / round-trip).
+- `ReadResourceResult` has no `isError` field (the read-error path compiles only
+  as a JSON-RPC error).
+- `read_resource` default is `method_not_found` (a server that overrides
+  `list_resources` but not `read_resource` 404s a listed read — asserted).
+- `Annotations` round-trips exactly `audience`/`priority`/`last_modified`.
+
+**Contract conformance (broker / integration):**
+- **Per-principal isolation:** a concurrent describe by principal B never appears
+  in principal A's list; a cache hit for B never serves A's snapshot. (Mirror the
+  existing audit-scope isolation test.)
+- **Capsule scoping:** a read of principal-B-owned state under principal A → error
+  + empty contents.
+- **Deterministic dedup:** two capsules serving one URI resolve to the
+  source-id-first entry across repeated runs (no arrival-order dependence).
+- **Read fail-closed:** unknown URI and out-of-family URI → JSON-RPC error, not
+  `{contents: []}`; over-cap read → error, never truncated.
+- **list_changed:** a resource-only capsule load pushes `resources/list_changed`
+  (independent of the tool-name diff).
 
 ## Capability
 
 Serving a resource requires **no new capability** — a capsule serves only what it
 can already read. A capsule serving per-principal kernel state (e.g.
-`astrid://capabilities` or `astrid://budget`) needs whatever self-scoped view
-capability that data already requires (e.g. a `self:…:view` grant); that is the
-serving capsule's concern, not the contract's. The contract adds no privilege.
+`astrid://capabilities`) needs whatever self-scoped view capability that data
+already requires (e.g. a `self:…:view` grant); that is the serving capsule's
+concern, not the contract's.
+
+**Collision trust model (v1 = operator-trust).** Capsule installation is
+operator-controlled: a capsule's resources are as trusted as the operator's
+decision to install it, and a new capsule *replacing* another's URI may be
+intentional. Within that boundary, URI collision is resolved by the deterministic
+source-id tie-break (Topics) plus a loud audit — not a security control, a
+predictability control. The stronger model — a **signed-registry URI authority**
+for an *untrusted* third-party ecosystem — is Future possibilities, not 1.0.
 
 # Drawbacks
 [drawbacks]: #drawbacks
 
-- A third capsule interface to maintain (`tool`, `resource`, and the existing
-  prompt-assembly interface), each with its own records, topics, and SDK
-  surface. The resource records are notably larger than tools' (the full MCP
-  shape), though most fields are optional.
-- Read routing depends on the broker's `uri → source-id` table from the describe
-  snapshot; a stale snapshot can misroute a read (mitigated by re-describe on
-  miss, at the cost of latency on the miss path).
-- Resources overlap conceptually with read-only tools. Without guidance, a
-  capsule author may be unsure whether to model a read as a tool or a resource.
-- Carrying fields the reference shim cannot surface today (`read-response.meta`)
-  is a deliberate forward-compat cost: a small amount of dead surface now to
-  avoid a breaking record change later.
+- A third capsule interface to maintain. The resource records are larger than
+  tools' (the full MCP shape), though most fields are optional.
+- Read is broadcast-and-self-filter, not targeted — every read-serving capsule
+  wakes for every read and self-filters. Acceptable at the expected capsule count;
+  a content-addressed `resource.v1.read.<hash(uri)>` per-URI subscription is the
+  escape hatch if it ever matters.
+- Per-principal correctness rests on the broker's drain filter and per-principal
+  cache keying being implemented — the conformance tests exist to keep them honest.
+- `read-response.meta` is carried but unsurfaceable today (forward-compat cost).
 
 # Rationale and alternatives
 [rationale-and-alternatives]: #rationale-and-alternatives
 
-- **Why mirror the `tool` interface.** The fan-out / aggregate / route machinery
-  already exists and is proven for tools. An interceptor request/response
-  contract over a `*.v1.*` topic family keeps the broker uniform. An interceptor
-  is the correct primitive because resources are *fetchable*; modelling them as
-  events would force request/response onto a broadcast mechanism.
-- **Why `resource-contents` is a `variant`, not a scalar string or two optional
-  fields.** MCP returns `(TextResourceContents | BlobResourceContents)[]` — an
-  *array* of a *discriminated union*. A scalar `string` (the naive shape) cannot
-  represent the array, and inferring text-vs-blob from `mime-type` is undecidable
-  (`application/json` is text, `image/svg+xml` is text, `application/octet-stream`
-  is blob). The WIT `variant` makes the discriminant explicit and lossless and
-  maps 1:1 onto rmcp's untagged enum. This is the load-bearing shape decision.
-- **Why the full field set now.** A WIT record is immutable; adding a field
-  post-1.0 breaks the package. `title`, `size`, `annotations`, `icons`, and
-  `_meta` are all in the current `Resource` and surfaceable by the reference rmcp
-  pin. Omitting any of them would force a breaking change the first time it is
-  wanted. `_meta` in particular makes most *future* MCP additions non-breaking
-  (they ride the escape hatch), so it is the highest-leverage field to include.
-- **Alternative: expose resources as read-only tools.** Rejected. A tool read
-  costs a tool-call slot and an agent-loop turn, and MCP clients treat resources
-  and tools as distinct surfaces (resources attach as re-readable context). It
-  also cannot express multi-content reads naturally.
-- **Alternative: hardcode a fixed resource set in the broker or shim.** Rejected.
-  Puts capsule-domain knowledge in the router, is not extensible to third-party
-  capsules, and violates the broker-is-dumb invariant.
-- **Alternative: a host function rather than a bus contract.** Rejected.
-  Resources are capsule-served domain data, not a kernel primitive.
-- **Alternative: multiplex templates onto `describe` via a `kind` field.**
-  Rejected in favour of a separate reserved topic — templates are a distinct MCP
-  endpoint with a distinct record (`uriTemplate`, not `uri`); a separate topic
-  keeps both records clean and the addition purely additive.
+- **Why mirror the `tool` interface — and where it does NOT.** The
+  fan-out/aggregate machinery is proven for tools, so the *structure* is reused.
+  But the RFC mirrors the **live mechanism** (empty broadcast request, per-source
+  response topics, source-id attribution), not `tool.wit`'s vestigial
+  `correlation-id` field — an earlier draft of this RFC mis-copied that dead field
+  and is corrected here.
+- **Why `resource-contents` is a `variant`.** MCP returns
+  `(TextResourceContents | BlobResourceContents)[]` — an array of a discriminated
+  union; rmcp models it as an untagged enum. A scalar string cannot represent the
+  array, and inferring text-vs-blob from `mime-type` is undecidable. The variant
+  is explicit and lossless. (Verified sound.)
+- **Why read is broadcast-self-filter, not targeted.** The bus has no
+  source-id-targeted publish — only topic-keyed `publish`/`publish_as`. The tool
+  path routes only because the name is *in the topic* (`tool.v1.execute.<name>`).
+  Targeted read delivery is unimplementable without a per-URI topic, so the read
+  is broadcast and capsules self-filter.
+- **Why single-page pagination.** Resource cardinality is small; real windowing
+  needs immutable snapshot retention the current cache cannot express (it would be
+  new machinery, not a broker-only flip). Shipping single-page behind a
+  cursor-free capsule contract avoids freezing a pagination model that does not
+  work into the 1.0 records.
+- **Alternative: expose resources as read-only tools.** Rejected — a tool read
+  costs a tool-call slot, clients treat resources and tools differently, and tools
+  cannot model multi-content reads.
+- **Alternative: hardcode a resource set in the broker/shim.** Rejected —
+  capsule-domain knowledge in the router, not extensible, violates broker-is-dumb.
 
 # Prior art
 [prior-art]: #prior-art
 
-- **Model Context Protocol — `resources` (2025-11-25 schema).** The complete
-  surface and this RFC's verdict on each: `resources/list` (**adopt**),
-  `resources/read` with a text/blob content *array* (**adopt/adapt** — the array
-  is the key adaptation), `ResourceTemplate` + `resources/templates/list`
-  (**defer, non-precluding**), `resources/subscribe` + `notifications/
-  resources/updated` (**exclude by construction** — needs server→client push
-  Astrid lacks), `notifications/resources/list_changed` (**adopt** — broadcast-
-  shaped, already present for tools), `Annotations`, `_meta`, `size`, `title`,
-  `icons` (**adopt**, all carried), cursor pagination (**adapt** to the fan-out),
-  `completion/complete` for template variables (**defer** with templates). The
-  RFC reconciles the whole model, not a subset.
-- **Astrid's own `tool` interface** (`astrid-bus:tool@1.0.0`). The direct
-  structural precedent: a record-only WIT interface bound to a `*.v1.*` topic
-  family, served by handler-bound subscribers and aggregated by the broker.
-- **rmcp** (the reference shim's MCP library) — its `Resource` / `RawResource`,
-  untagged `ResourceContents`, and `Annotations` types fix the concrete field
-  shapes the WIT must reshape to, and its lag from the spec (no result-level read
-  `_meta`) bounds what the shim surfaces today.
+- **MCP `resources` (2025-11-25 schema), reconciled in full:** `resources/list`
+  (**adopt**), `resources/read` with a text/blob content *array* (**adopt/adapt**),
+  `ResourceTemplate` + `resources/templates/list` (**defer, non-precluding**),
+  `resources/subscribe` + `resources/updated` (**exclude by construction** — no
+  server→client push), `list_changed` (**adopt** — broadcast-shaped),
+  `Annotations`/`_meta`/`size`/`title`/`icons` (**adopt**, all carried), cursor
+  pagination (**single-page in 1.0**), `completion/complete` (**defer** with
+  templates).
+- **Astrid's own `tool` interface** — the structural precedent; this RFC follows
+  its *live* fan-out mechanism (source-id response topics, name/uri dedup), not its
+  WIT's vestigial correlation-id.
+- **rmcp 1.7.0** (the shim's library) — fixes the concrete reshape targets and the
+  default-handler behaviour the shim must override.
 
 # Unresolved questions
 [unresolved-questions]: #unresolved-questions
 
-- **Pagination behavior.** Ship v1 single-page (`next-cursor: none`) behind the
-  paginated shape (recommended), or window from day one? The shape is fixed
-  either way; this is a broker-behavior choice, deferrable without contract risk.
-- **Read routing.** Targeted (broker publishes to the owning capsule, as written)
-  vs. fan-out-and-self-filter (every capsule sees the read, the owner answers).
-  The targeted form mirrors `tool.v1.execute.<name>`; the fan-out form is simpler
-  but noisier.
-- **Describe snapshot TTL / drain window.** Match the tool surface's exactly, or
-  tune independently for resources?
-- **`read-response.meta` reservation.** Carried now as forward-compat insurance
-  against a future rmcp pin gaining result-level `_meta`. If the maintainers
-  prefer a strictly-surfaceable contract, it can be dropped — at the cost of a
-  breaking change if read-level `_meta` is ever wanted.
+- **`describe-request` is an empty record.** Keep it as an explicit empty record
+  (named, documented, reserved) or drop it and specify "empty payload"? (Lean:
+  keep the named record for symmetry and a reserved extension point.)
+- **Dedup tie-break direction** — source-id-sorts-*first* vs *last*; either is
+  deterministic. Pick one and pin it in the conformance test.
+- **Read-serving fan-out cost** at scale — if the read-serving capsule count grows
+  large, move to a per-URI content-addressed topic (`resource.v1.read.<hash>`); not
+  needed at the expected count.
+- **Drain window / TTL values** — adopt the tool surface's (≈ 500 ms describe,
+  100 ms slice) as v1 defaults, or tune for resources? Bound the read-miss
+  re-describe to a shorter window than full discovery.
 
 # Future possibilities
 [future-possibilities]: #future-possibilities
 
-- **Resource templates** — `resources/templates/list` with RFC 6570
-  `uriTemplate`s. Additive: a new `resource.v1.request.describe-templates` topic
-  (reserved above) and a new `resource-template` record (`uri-template`,
-  `name`/`title`/`description`/`mime-type`/`annotations`/`meta`). No change to the
-  records defined here.
-- **`completion/complete`** for template URI variables — rides with templates as
-  a new completion-shaped topic + a `resource-template-reference`. Meaningless
-  without templates; deferred together.
-- **A subscribe surface** — `resources/subscribe` + per-resource update
-  notifications — *if and when* Astrid grows a genuine server → client push
-  channel. Re-addable as a new `resource.v1.request.subscribe` topic plus
-  flipping the shim's `subscribe` capability to `true`; the records here do not
-  preclude it. The absence today is by construction, not oversight.
+- **Signed-registry URI authority** (the robust answer to URI squatting for an
+  *untrusted* ecosystem). A capsule declares its owned `astrid://<namespace>/` in
+  its manifest; the registry binds that namespace to the capsule's **signed
+  release identity** (releases signed with the author's key); the broker rejects a
+  describe/read for a namespace the responding source-id does not own. Ties to the
+  registry capsule and the marketplace; out of scope for 1.0's operator-trust
+  model.
+- **Resource templates** — `resources/templates/list` (RFC 6570 `uriTemplate`).
+  Additive: a new `…describe-templates` topic + a `resource-template` record. No
+  change to the records here. `completion/complete` rides with it.
+- **A subscribe surface** — `resources/subscribe` + update notifications — *if and
+  when* Astrid grows a server→client push channel. Re-addable as a new topic +
+  flipping the shim's `subscribe` capability; the records here do not preclude it.
 - **An SDK `#[astrid::resource(...)]` macro** mirroring `#[astrid::tool(...)]`,
-  generating the describe/read handlers from an attribute.
+  injecting the Verified-principal-or-fail-closed prologue so per-principal scoping
+  is correct by construction.
 - **A reference introspection capsule** serving `astrid://capabilities`,
-  `astrid://budget`, and `astrid://capsules` — the first concrete consumer of
-  this contract, and the per-principal self-awareness surface for agent runtimes
-  hosted on Astrid.
-- **The MCP `prompts` primitive** as a sibling interface for named prompt
-  templates. Distinct from the existing `astrid-bus:prompt` interface, which is
-  internal prompt *assembly*, not a client-facing template library; that interface
-  should be renamed (e.g. `prompt-builder`, aligning the package with the
-  `prompt_builder.v1.*` topics and the `prompt-builder` capsule it already uses)
-  before `prompt` is reused for the MCP sense.
+  `astrid://budget`, `astrid://capsules` — the first consumer and the
+  per-principal self-awareness surface for agent runtimes on Astrid.
+- **The MCP `prompts` primitive** as a sibling interface — distinct from the
+  existing `astrid-bus:prompt` *assembly* interface (which should be renamed,
+  e.g. `prompt-builder`, before `prompt` is reused for the MCP sense).
