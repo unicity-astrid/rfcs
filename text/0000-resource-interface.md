@@ -308,6 +308,25 @@ response envelope identifies the owning capsule, so the broker builds a
 `uri → source-id` routing table from the snapshot. A `read` for a URI not in the
 table triggers a re-describe before failing.
 
+**Discovery is a 1→N scatter-gather, and the drain is the requester's job.** One
+request, one shared `correlation-id`, and every serving capsule replies on the
+same `…response.describe.<correlation-id>` topic; the broker tells the replies
+apart by their `source-id`. A serving capsule implements only its
+`resource_describe` handler — return its list (scoped to the principal), echo the
+`correlation-id` — and **never drains or aggregates**. The collection
+(subscribe-before-publish, drain the window, dedupe, sort, paginate) lives once,
+on the requester side; capsules do not hand-roll it. The 1:1 `read` is the
+degenerate case — a drain window that stops at the first reply, i.e.
+`ipc::request_response`.
+
+Because the responder count is unknown (capsule topology is open) and the window
+is bounded, **`describe` is best-effort**: the aggregate is *every resource from
+every capsule that answered within the window*, not a hard completeness
+guarantee. A capsule that misses the window is absent from that round and
+reappears on the next `describe` — driven by a `list_changed` nudge (capsule
+load/unload) or a re-describe on a read miss. Eventual consistency, not snapshot
+consistency.
+
 **Reserved for templates (additive, not defined here).** Resource *templates*
 (below, Future possibilities) get their own topic family
 `resource.v1.request.describe-templates` /
