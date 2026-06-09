@@ -581,8 +581,6 @@ for an *untrusted* third-party ecosystem — is Future possibilities, not 1.0.
 - **`describe-request` is an empty record.** Keep it as an explicit empty record
   (named, documented, reserved) or drop it and specify "empty payload"? (Lean:
   keep the named record for symmetry and a reserved extension point.)
-- **Dedup tie-break direction** — source-id-sorts-*first* vs *last*; either is
-  deterministic. Pick one and pin it in the conformance test.
 - **Read-serving fan-out cost** at scale — if the read-serving capsule count grows
   large, move to a per-URI content-addressed topic (`resource.v1.read.<hash>`); not
   needed at the expected count.
