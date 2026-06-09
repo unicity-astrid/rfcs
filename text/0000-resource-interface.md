@@ -499,33 +499,6 @@ emits on the reference rmcp pin. Verified against the pinned 1.7.0 source:
 Everything else the contract carries — multi-content, `title`, `icons`, per-chunk
 `mime-type`/`meta` — is surfaceable on 1.7.0 today.
 
-## Conformance tests
-
-The RFC mandates two test families so the assumptions are *guarded*, not merely
-checked once:
-
-**rmcp-shape guards (in the shim crate, compile against the pinned rmcp).** A
-future rmcp bump that changes these MUST break a test, not silently drift:
-- `RawResource.size` accepts the WIT `u32` (a type-level assertion / round-trip).
-- `ReadResourceResult` has no `isError` field (the read-error path compiles only
-  as a JSON-RPC error).
-- `read_resource` default is `method_not_found` (a server that overrides
-  `list_resources` but not `read_resource` 404s a listed read — asserted).
-- `Annotations` round-trips exactly `audience`/`priority`/`last_modified`.
-
-**Contract conformance (broker / integration):**
-- **Per-principal isolation:** a concurrent describe by principal B never appears
-  in principal A's list; a cache hit for B never serves A's snapshot. (Mirror the
-  existing audit-scope isolation test.)
-- **Capsule scoping:** a read of principal-B-owned state under principal A → error
-  + empty contents.
-- **Deterministic dedup:** two capsules serving one URI resolve to the
-  source-id-first entry across repeated runs (no arrival-order dependence).
-- **Read fail-closed:** unknown URI and out-of-family URI → JSON-RPC error, not
-  `{contents: []}`; over-cap read → error, never truncated.
-- **list_changed:** a resource-only capsule load pushes `resources/list_changed`
-  (independent of the tool-name diff).
-
 ## Capability
 
 Serving a resource requires **no new capability** — a capsule serves only what it
