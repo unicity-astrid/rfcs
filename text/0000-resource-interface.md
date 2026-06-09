@@ -13,8 +13,9 @@ they surface to MCP clients connected through `astrid mcp serve` as MCP
 `astrid-bus:resource@1.0.0` package of typed payload records carried on a
 `resource.v1.*` topic family, served by handler-bound subscribers, fanned out
 for discovery and routed per-URI for reads. Resources are **fetchable, not
-events** — request/response, not broadcast. They are pull-only, per-principal
-scoped, and never carry secrets.
+events**: the operations are request/response *over* Astrid's pub/sub bus —
+`read` a routed 1:1 exchange, `describe` a 1→N scatter-gather the broker
+aggregates. They are pull-only, per-principal scoped, and never carry secrets.
 
 The wire shape is sized for the *complete* MCP resource model as of the
 2025-11-25 schema revision — multi-content reads (text/blob arrays), `title`,
@@ -46,10 +47,13 @@ the agent loop.
 
 Four properties drive the design:
 
-1. **Fetchable, not broadcast.** Listing resources and reading a resource are
-   request/response operations — interceptors, in Astrid terms (a `[subscribe]`
-   entry bound to a `handler`), not fire-and-forget events. The contract models
-   RPC, not pub/sub.
+1. **Fetchable, not fire-and-forget.** Listing and reading are request/response
+   operations — *interceptors*, in Astrid terms: a `[subscribe]` entry bound to a
+   `handler` that replies, realized over the pub/sub bus as a request topic
+   answered on a correlation-keyed response topic. `read` is a routed 1:1
+   request/response; `describe` is a 1→N scatter-gather the broker fans out and
+   aggregates (multiple capsules can serve resources). Resources are *fetched* on
+   demand, not broadcast as events.
 2. **Served by capsules, discovered by the broker.** Resources populate
    *automatically* from whatever capsules can serve them — the same fan-out the
    tool surface already uses. The broker stays a dumb aggregator; it never holds
