@@ -273,18 +273,27 @@ id-keyed call. It is audited (op + principal + capsule + id-hash).
 /// Gates (all fail closed):
 ///   - the caller MUST hold the `uplink` capability (this exfiltrates an fd to
 ///     a socket peer; only the socket-owning proxy may perform it);
-///   - the target process MUST belong to the calling invocation's effective
-///     principal (and capsule), enforced by the same creator re-check as every
-///     id-keyed call;
+///   - `principal` is the principal the uplink asserts it is acting for (the
+///     authenticated principal of the requesting socket client), following the
+///     `publish-as` trust precedent: the host validates the string as a
+///     principal id and checks it against the process owner. The target
+///     process MUST be owned by exactly that principal. Note this is
+///     deliberately NOT the creator-capsule re-check used by the other
+///     id-keyed calls — the proxy is never the creating capsule (the agent
+///     capsule spawns; the proxy attaches), and the proxy's own effective
+///     principal is its load-time owner, not the client it bridges. The
+///     principal boundary is the security boundary here; capsule-creator
+///     scoping continues to apply unchanged to every other id-keyed call;
 ///   - the target MUST be PTY-backed and still running;
 ///   - `stream` MUST be an AF_UNIX (Unix-domain) stream — SCM_RIGHTS fd passing
 ///     is AF_UNIX-only; a TCP stream is rejected.
 ///
-/// Errors: `capability-denied` (no `uplink`); `no-such-process` (unknown /
-/// wrong owner / reaped); `invalid-input` (not PTY-backed, child already
-/// exited, or `stream` is not a Unix-domain socket). Every successful attach
-/// emits an audit entry (process id, owner principal, capsule id).
-attach-terminal: func(id: process-id, stream: borrow<tcp-stream>) -> result<_, error-code>;
+/// Errors: `capability-denied` (no `uplink`); `invalid-input` (malformed
+/// `principal`, not PTY-backed, child already exited, or `stream` is not a
+/// Unix-domain socket); `no-such-process` (unknown id, owner mismatch, or
+/// reaped — one uniform error, no oracle). Every successful attach emits an
+/// audit entry (process id, asserted principal, capsule id).
+attach-terminal: func(id: process-id, stream: borrow<tcp-stream>, principal: string) -> result<_, error-code>;
 ```
 
 Semantics:
@@ -338,7 +347,9 @@ existing process error vocabulary:
 |---|---|
 | `terminal` set on synchronous `spawn` | `invalid-input` |
 | `attach-terminal` caller lacks `uplink` | `capability-denied` |
-| id unknown / wrong owner / wrong capsule / reaped | `no-such-process` |
+| `attach-terminal` asserted `principal` is malformed | `invalid-input` |
+| `attach-terminal` id unknown / owner ≠ asserted principal / reaped | `no-such-process` |
+| any other id-keyed call: id unknown / wrong owner / wrong capsule / reaped | `no-such-process` |
 | `resize` / `attach-terminal` target is not PTY-backed | `invalid-input` |
 | `attach-terminal` target child already exited | `invalid-input` |
 | `attach-terminal` stream is not AF_UNIX (e.g. a TCP stream) | `invalid-input` |
@@ -364,12 +375,19 @@ part of this design. It composes four independent checks, all fail-closed.
    `agent` capsule that spawned the process, not any tool capsule — can call
    `attach-terminal`. This confines fd exfiltration to the single component whose
    entire job is bridging the authenticated socket.
-3. **The process belongs to the caller's principal.** Like every id-keyed
-   persistent-tier call, `attach-terminal` re-resolves the live calling principal
-   and capsule and checks them against the recorded creator before touching the
-   entry. A proxy cannot attach a terminal to a process owned by a different
-   principal or created by a different capsule; the attempt collapses to
-   `no-such-process` with no oracle.
+3. **The process belongs to the asserted principal.** `attach-terminal` takes
+   the principal the uplink is acting for as an explicit parameter — the same
+   trusted-uplink assertion model as `publish-as` — and the host checks it
+   against the recorded process owner. The parameter is required because the
+   proxy cannot rely on its own invocation identity for this check: it is a
+   run-loop capsule (its effective principal is its load-time owner, not the
+   client it bridges) and it is never the creating capsule (the agent capsule
+   spawns; the proxy attaches). The principal boundary, not the creator-capsule
+   boundary, is the security boundary for attachment; an owner mismatch
+   collapses to `no-such-process` with no oracle. When per-connection principal
+   binding moves into the kernel (astrid#852), the asserted parameter can be
+   replaced by the kernel's own record of the connection's bound principal —
+   the gate's shape is forward-compatible with that upgrade.
 4. **Audit.** The handover is recorded (process id, owner principal, capsule id)
    at the moment of delegation.
 
@@ -408,8 +426,17 @@ package is desktop-kernel-only to begin with.
 
 ## Threat model — concrete abuses
 
-- **A capsule attaches someone else's process.** Blocked by the principal/capsule
-  creator re-check (gate 3): the id resolves to `no-such-process`.
+- **A capsule attaches someone else's process.** Blocked by the owner check
+  (gate 3): the asserted principal must match the process owner, and only the
+  `uplink`-holding proxy can assert a principal at all (gate 2). For any other
+  capsule the call dies at `capability-denied`; for the proxy asserting the
+  wrong principal the id resolves to `no-such-process`.
+- **A compromised proxy asserts an arbitrary principal.** True — and identical
+  in scope to the existing `publish-as` posture: the proxy is already the
+  component trusted to assert client principals per message, it is gated by the
+  `uplink` capability, and every assertion is audited. Kernel-owned
+  per-connection binding (astrid#852) is the planned upgrade that shrinks this
+  trust to one assertion per connection.
 - **A non-uplink capsule reaches `attach-terminal`.** Blocked by the `uplink`
   capability gate (gate 2): `capability-denied`. The `agent` capsule that owns
   the process *still cannot* hand its fd out — it lacks `uplink` — which is
@@ -508,7 +535,7 @@ unreachable for any program that needs a terminal.
 [unresolved-questions]: #unresolved-questions
 
 - **WIT representation of the attach target.** This RFC proposes
-  `attach-terminal(id, stream: borrow<tcp-stream>)`, reusing the `tcp-stream`
+  `attach-terminal(id, stream: borrow<tcp-stream>, principal)`, reusing the `tcp-stream`
   resource that `astrid:net`'s `unix-listener.accept` already yields for accepted
   Unix-domain connections. This introduces a **cross-interface resource
   dependency**: `astrid:process` would `use astrid:net/host.{tcp-stream}`. That
