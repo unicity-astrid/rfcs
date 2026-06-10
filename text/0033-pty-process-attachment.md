@@ -1,6 +1,6 @@
 - Feature Name: `pty_process_attachment`
 - Start Date: 2026-06-11
-- RFC PR: [rfcs#0000](https://github.com/unicity-astrid/rfcs/pull/0000)
+- RFC PR: [rfcs#33](https://github.com/unicity-astrid/rfcs/pull/33)
 - Tracking Issue: [astrid#0000](https://github.com/unicity-astrid/astrid/issues/0000)
 
 # Summary
