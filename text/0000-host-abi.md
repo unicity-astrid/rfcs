@@ -342,7 +342,9 @@ record process-info {
 // overflow, log-ring-bytes, max-lifetime-ms, idle-timeout-ms,
 // exit-retention-ms), honored only by `spawn-persistent` and ignored by the
 // ephemeral spawns, PLUS `limits: option<resource-limits>` (every tier;
-// enforcement NOT YET SUPPORTED — see the record above). `process-signal`
+// enforcement NOT YET SUPPORTED — see the record above) and
+// `file-injections: list<file-injection>` (every tier; see "Read-only file
+// injection" below). `process-signal`
 // gains `stop` (SIGSTOP, pause) and `cont` (SIGCONT, resume) alongside
 // term/hup/usr1/usr2/int, so a supervisor can throttle a runaway child without
 // killing it. `error-code` additionally carries: no-such-process (unknown /
@@ -449,6 +451,78 @@ a **secret** reaches a child over `write-stdin` (or `spawn-request.stdin`) —
 audit, as they already are) versus requiring an explicit secret channel is the
 one open semantics question on this surface; the field shape is unaffected
 either way.
+
+**Read-only file injection.** `spawn-request` carries an optional
+`file-injections: list<file-injection>`, honored by every tier, that materializes
+host-verified, **read-only** bytes at a chosen absolute path inside the child's
+existing OS sandbox. The motivating consumer is un-overridable per-spawn
+governance — handing a supervised agent a policy file it reads but a
+prompt-injected session cannot rewrite — but the primitive is deliberately
+**agent-neutral**: the host never parses the bytes and never interprets what
+`target` means. It is "materialize these verified bytes, read-only, at this
+path," the same shape as the workspace bind the sandbox already performs, so a
+Codex/Gemini/other adapter reuses it unchanged with its own target.
+
+```wit
+/// A read-only file the host materializes inside a spawned child's sandbox.
+/// `source` bytes are OPAQUE to the host — it never parses, validates, or
+/// filters content; any content policy (e.g. which keys an untrusted authoring
+/// capsule may set) is the authoring adapter's concern, not this ABI's.
+record file-injection {
+    /// VFS path (e.g. `home://...`) the capsule authored; read host-side at spawn.
+    source: string,
+    /// Absolute path at which the child reads the injected bytes.
+    target: string,
+    /// 1.0 supports only `true` (read-only). `false` (a writable bind) is
+    /// reserved — it would not satisfy the write-protection invariant below —
+    /// and returns `invalid-input`. Declared now so the record shape is stable.
+    read-only: bool,
+}
+// spawn-request additionally carries: file-injections: list<file-injection>
+// (every tier; absent or empty => no-op, no injected file).
+```
+
+**No new capability; strictly a restriction surface.** Injection rides
+`host_process` and is permitted only into the caller's *own* child. It confers no
+authority the caller does not already hold: a capsule that already dictates the
+child's `args` / `env` / `cwd` / `stdin` can already determine everything the
+child does, so handing it an *unmodifiable* file is strictly weaker than control
+of `argv`. The value is the opposite of escalation — the injected bytes bind the
+child even against a session that captures it. (The host permits injection only
+into the spawn the caller owns, so the "an untrusted author hands the host a
+policy" question never arises at this layer; it is an adapter concern.)
+
+**Write-protection invariant** — the property the primitive delivers. The bytes
+the child reads at `target` MUST NOT be writable by **(a)** the child or any
+subprocess it spawns, **nor (b)** the spawning principal's capsule `fs` surface
+(`fs_*` runs in capsule space, *outside* the child's OS sandbox; a `home://`
+-spanning `fs` capability could otherwise rewrite a home-staged file between
+authoring and read). A live bind of the caller-supplied `source` would violate
+(b) and is therefore forbidden.
+
+**Integrity contract.** Per injection, at spawn, the host: (1) **snapshots**
+`source` into a host-owned path outside every VFS mount — unwritable by the child
+*and* by the principal's `fs` surface; (2) **content-hashes** the snapshot
+(BLAKE3), pins it, and **verifies** the exposed bytes match the pin, closing the
+copy→expose TOCTOU; (3) records the hash in the **spawn audit** (which policy
+governed the session). Verification is the integrity leg; the audit row is the
+attribution leg — recording without verifying would log a policy that may not be
+the one the child actually read.
+
+**Per-OS mechanism.** Both satisfy the invariant; the contract ("verified
+read-only bytes at `target`") is identical across platforms, so an OS-aware
+caller supplies a `target` appropriate to the platform.
+
+- **Linux** — `--ro-bind <snapshot> <target>` in the `bwrap` namespace that
+  already wraps the child. `target` may be any absolute path (the namespace
+  creates the mount point; it need not exist on the host), so the caller can
+  target a path the agent reads canonically.
+- **macOS** — Seatbelt has no mount namespace, so the host materializes the
+  verified snapshot **at `target`** and the profile denies `file-write*` on that
+  literal path. `target` must therefore be a host-writable path **outside the
+  principal's VFS surface**; a `target` resolving within `home://` / `cwd://` /
+  tmp is rejected (`boundary-escape`), because materializing there would leave the
+  bytes writable by the principal's `fs_*` surface and defeat invariant (b).
 
 ## Guest exports
 
