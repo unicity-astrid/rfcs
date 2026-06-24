@@ -87,24 +87,27 @@ safe to expose over HTTP to paired devices and to untrusted agent tools.
 
 ## Talking to a session capsule
 
-Requests and responses travel as JSON events on string topics:
+`append` is fire-and-forget: a capsule subscribes `session.v1.append` and
+publishes no reply, so it carries no correlation id. Every **other** verb is
+request/response over string topics:
 
-- A request is published on `session.v1.request.<verb>` carrying a
+- The request is published on `session.v1.request.<verb>` carrying a
   `correlation-id`.
 - The reply is published on the **per-request scoped** topic
   `session.v1.response.<verb>.<correlation-id>`. Scoping the reply topic to the
   correlation id (rather than a shared response topic filtered by id) means a
   concurrent caller's reply can never be delivered to the wrong waiter.
-- `append` is the one exception: fire-and-forget, no reply.
 
-A `correlation-id` is an opaque, caller-chosen token that is a **single
-dot-free topic segment** (a UUIDv4 is the canonical choice). A capsule MUST
-reject a missing, empty, or dot-containing correlation id.
+For these request/response verbs the `correlation-id` is an opaque,
+caller-chosen token that is a **single dot-free topic segment** (a UUIDv4 is the
+canonical choice); a capsule MUST reject a missing, empty, or dot-containing
+correlation id.
 
 ## Live multi-device sync
 
-After a successful mutation (`create`, `update`, `delete`), a conforming capsule
-fans out a `session.v1.event.<kind>` notification. Because the bus stamps it with
+After a thread is created (via `clear`), updated, or deleted, a conforming
+capsule fans out a `session.v1.event.<kind>` notification (`created` /
+`updated` / `deleted`). Because the bus stamps it with
 the acting principal, a per-principal subscriber — e.g. a gateway's live feed
 shared across a principal's devices — receives only its own events, and a second
 device updates its thread list the instant the first renames or deletes a thread,
@@ -129,8 +132,10 @@ without polling.
 
 ## WIT schema
 
-The contract is the `astrid-bus:session@1.1.0` package in
-`interfaces/session.wit`. A capsule does **not** bind these via the component
+The contract is the `astrid-bus:session@1.1.0` package, defined canonically as
+`interfaces/session.wit` in the [`unicity-astrid/wit`](https://github.com/unicity-astrid/wit)
+repository (and mirrored into each SDK's contracts bundle) — it does not live in
+this RFC repo. A capsule does **not** bind these via the component
 linker (bus interfaces are advisory payload specs); it publishes and subscribes
 by string topic and serialises with serde JSON. The records define the wire
 shape:
@@ -149,7 +154,11 @@ interface session {
     record clear-response  { correlation-id: string, new-session-id: string,
                              old-session-id: string }
     record append-request  { session-id: string, messages: list<message> }
-    record session-cleared { session-id: string }   // fan-out on session.v1.clear
+    // session-cleared is a legacy 1.0.0 fan-out the AGENT LOOP (not the session
+    // capsule) publishes on `session.v1.clear` after a clear, so unrelated
+    // capsules can drop per-session ephemeral state — distinct from this
+    // capsule's clear-response and from the session.v1.event.* lifecycle events.
+    record session-cleared { session-id: string }
 
     // — 1.1.0 (additive) —
     record list-request {
@@ -196,9 +205,12 @@ interface session {
 ```
 
 JSON field names are the snake_case form of the WIT kebab-case (`session_id`,
-`include_archived`, `last_message_preview`, …). `option<T>` fields are absent or
-JSON `null`; the patch semantics below give *absence* a distinct meaning from
-`null`/`""` for `update`.
+`include_archived`, `last_message_preview`, …). For every verb except `update`,
+an `option<T>` field is interchangeably absent or JSON `null`. **`update` is
+patch-by-presence** (see its semantics below): an *omitted* key means "leave
+unchanged", a present empty string (`title`/`meta`) means "clear" to `null`, an
+explicit JSON `null` is treated the same as omission ("leave unchanged"), and a
+present non-empty value sets the field.
 
 ## Verb semantics
 
