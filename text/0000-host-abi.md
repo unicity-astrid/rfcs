@@ -127,7 +127,7 @@ top-level functions on the `host` interface.
 | `astrid:uplink` | uplink-register/send | `uplink` | Frontend connection registration |
 | `astrid:kv` | get/set/delete/cas/list/list-page/clear-prefix | (ungated) | Per-capsule, per-principal key-value with atomic CAS |
 | `astrid:net` | `unix-listener` / `tcp-listener` / `tcp-stream` / `udp-socket` resources + factories | `net`, `net_connect`, `net_udp`, `net_tcp_bind` | Unix sockets, outbound TCP, inbound TCP, UDP (unconnected + connected), DNS resolution |
-| `astrid:http` | `http-stream` resource + http-request | `net` | HTTP client with SSRF airlock, streaming responses, typed method enum |
+| `astrid:http` | `http-stream` resource + `http-request`, **plus** an options-bearing `@1.1.0` tier (`http-request-opts` / `http-stream-start-opts` / `http-upload-start` taking a `request-options` record, `response-meta`, stream `trailers`) | `net` | HTTP client with SSRF airlock, streaming responses, typed method enum; `@1.1.0` adds caller-set timeouts/redirect/size-cap/integrity and streaming uploads (see "HTTP: per-request control and streaming uploads") |
 | `astrid:sys` | log, config, get-caller, clock-ms, clock-monotonic-ns, sleep-ns, random-bytes, check-capsule-capability, enumerate-capabilities | (ungated) | Logging, manifest config, time, entropy, capability introspection (self-enumeration + per-name check) |
 | `astrid:process` | `process-handle` resource + spawn/spawn-background, **plus** a persistent tier (`spawn-persistent` → `process-id`, `attach`, id-keyed read/signal/wait/write/stop, `list-processes`/`status`, `watch`) | `host_process` (+ operator `allow_persistent` for the persistent tier) | OS-sandboxed (Seatbelt/bwrap) spawn with stdin/env/cwd, wait/signal/kill, exit-info; reattachable host-owned background processes addressed by principal-scoped id (see "Process: ephemeral and persistent tiers") |
 | `astrid:elicit` | elicit/has-secret | `uplink` | Install/upgrade-time user prompts with typed elicit-type and elicit-response |
@@ -543,6 +543,148 @@ the one the child actually read.
   host write. An agent whose only enforced tier is a fixed macOS system path is
   therefore not governable this way without operator/root provisioning — an
   inherent platform limit, not an ABI gap.
+
+### HTTP: per-request control and streaming uploads (`@1.1.0`)
+
+`astrid:http@1.0.0` is deliberately minimal: a buffered `http-request` and a
+streaming `http-stream-start`, each taking a flat `http-request-data` record
+(`{url, method, headers, body}`) and bound by host-fixed deadlines — 30 s
+whole-request on the buffered path, 30 s connect plus 120 s per-chunk on the
+streaming path. Every deadline is a host constant with no caller override, and
+the request record carries no field through which to tighten or relax one. This
+is too coarse at both ends: a model-discovery probe (`GET {base}/v1/models`
+inside a describe interceptor) wants a sub-second fail-fast deadline so a hung
+upstream cannot occupy a pooled slot, while a large download wants a deadline
+well above 30 s. `astrid:http@1.1.0` adds the per-request control surface and is
+the **first worked example of the evolution discipline below** (Rules 1–3): a
+new frozen `host/http@1.1.0.wit` registered alongside `@1.0.0`, with the
+`@1.0.0` host handler delegating to the shared backend with defaulted options.
+Capsules adopt it package-by-package; nothing built against `@1.0.0` is touched.
+
+**What goes in the contract — and what deliberately does not.** A knob belongs
+in the ABI only if it is a property of one request/response that the kernel
+routes and the host enforces. Three classes fall out:
+
+- *In the contract (`@1.1.0`):* per-request timeouts, redirect policy,
+  response/decompression size caps, scheme restriction, and subresource
+  integrity — all carried by an all-optional `request-options` record, so an
+  empty value is byte-for-byte `@1.0.0` behaviour — plus response metadata
+  (final URL, redirect count, timing), a streaming **request** body (upload),
+  and response trailers.
+- *Not a contract change — host-internal:* connection reuse. `@1.0.0` builds a
+  fresh client per call, so discovery-then-generation against one host pays two
+  TLS handshakes; an origin-keyed client pool inside the host removes that with
+  no surface change and ships independently of any version bump.
+- *Not a contract change — capsule/SDK space:* SSE event framing, cookie jars,
+  retry/backoff. SSE parsing is framing logic, not a host privilege — it is an
+  SDK helper (one `Vec<u8>`-buffered chunk→event iterator that subsumes the
+  three hand-rolled provider parsers, one of which carries a
+  UTF-8-split-across-chunks bug) and needs no WIT. The kernel-is-dumb boundary
+  draws the line: the host owns the socket, the airlock, and the deadline; the
+  capsule owns what the bytes *mean*.
+
+```wit
+/// All fields optional; an empty `request-options` is exactly `@1.0.0`
+/// behaviour. The `@1.0.0` `http-request` / `http-stream-start` are the
+/// options-bearing functions below called with a defaulted value.
+record request-options {
+    /// Caller deadlines, each capped by a host ceiling; `none` per field =>
+    /// the host default for that phase.
+    timeouts: option<timeout-config>,
+    /// What to do with a 3xx. `follow` re-validates EVERY hop through the
+    /// airlock; the default for an untrusted capsule is `error`, not silent
+    /// follow.
+    redirect: option<redirect-policy>,
+    max-redirects: option<u32>,
+    /// Buffered-path response cap; `none` => host default. The host enforces a
+    /// hard ceiling above which `body-too-large` is returned regardless.
+    max-response-bytes: option<u64>,
+    /// Ceiling on DECOMPRESSED bytes — decompression-bomb defence.
+    max-decompressed-bytes: option<u64>,
+    /// Auto-decompress gzip/br/deflate/zstd (default true). `false` delivers the
+    /// raw wire bytes (binary / non-UTF-8 downloads).
+    auto-decompress: option<bool>,
+    /// Refuse any non-https scheme.
+    https-only: option<bool>,
+    /// Subresource integrity "sha256-<base64>"; host verifies, returns
+    /// `integrity-mismatch` on failure.
+    integrity: option<string>,
+}
+record timeout-config {
+    connect-ms: option<u64>,       // TCP + TLS establish
+    first-byte-ms: option<u64>,    // request sent -> first response byte
+    between-bytes-ms: option<u64>, // idle gap between body chunks (streaming)
+    total-ms: option<u64>,         // whole-request hard deadline
+}
+enum redirect-policy { follow, error, manual }
+
+/// Metadata the `@1.0.0` `{status, headers, body}` response cannot carry; rides
+/// the `@1.1.0` response record (a NEW type in the new file — the `@1.0.0`
+/// record stays frozen).
+record response-meta {
+    final-url: string,   // after redirects (= request url if none)
+    redirect-count: u32,
+    elapsed-ms: u64,     // host already records this; now returned
+    wire-bytes: u64,     // received, pre-decompression
+}
+
+http-request-opts:      func(request: http-request-data, options: request-options)
+    -> result<http-response-data, error-code>;   // @1.1.0 record carries `meta`
+http-stream-start-opts: func(request: http-request-data, options: request-options)
+    -> result<http-stream, error-code>;          // @1.1.0 http-stream adds `trailers`
+
+/// Streaming request body. `@1.0.0` `body: option<list<u8>>` forces the whole
+/// payload into guest memory first; here the caller writes the body
+/// incrementally and `finish` seals it and yields the response stream.
+resource http-upload {
+    body-sink:          func() -> output-stream;
+    subscribe-writable: func() -> pollable;
+    finish:             func() -> result<http-stream, error-code>;
+}
+http-upload-start: func(request: http-request-data, options: request-options)
+    -> result<http-upload, error-code>;
+
+// @1.1.0 also: `http-stream.trailers() -> result<option<list<key-value-pair>>,
+// error-code>` (available after EOF); `error-code` gains redirect-blocked,
+// too-many-redirects, integrity-mismatch, scheme-denied, decompression-bomb.
+```
+
+**Security: the airlock owns name resolution and the connect path.** The SSRF
+airlock's correctness depends on the host — not the capsule — deciding which IP
+a name resolves to and which socket is opened. Every general-client knob that
+would let a guest influence that decision is therefore **excluded by
+construction**, not merely omitted: custom DNS resolvers and static
+`resolve`/`resolve-to-addrs` overrides, proxies, source-address / interface
+binding, `accept-invalid-certs` / `accept-invalid-hostnames`, SNI suppression,
+TLS-version downgrade, custom trust roots, TLS keylog, and non-`http(s)` schemes
+— none appear in `request-options`. Conversely, `@1.1.0` is the point to
+*strengthen* the airlock: redirect `follow` MUST re-validate every `Location`
+hop through the airlock (a `30x` to `127.0.0.1` or `169.254.169.254` is the
+canonical SSRF bypass) and strip `Authorization`/`Cookie` on a cross-origin hop,
+and the default policy for an untrusted capsule is `error`/`manual`. `https-only`,
+scheme restriction, integrity, and the decompressed-size ceiling are
+security-positive capabilities the surface *gains* rather than withholds.
+
+**Two design forks, resolved.** *(1) Per-request options vs. a client/session
+resource.* `@1.1.0` threads options per call rather than introducing an
+`http-client` handle. The airlock and audit re-validate on every call
+regardless, so a stateful handle adds surface without security value; the one
+thing it buys — connection reuse — is the host-internal pool above. A session
+resource remains a clean later option if a genuinely stateful web-session
+capsule emerges. *(2) Client certificates (mTLS).* Deferred. The key material a
+capsule would present must not cross the guest boundary as raw bytes — it
+belongs in daemon key custody behind a host-held identity handle, its own design
+— and no current consumer needs it; `request-options` leaves room for an opaque
+`tls-identity` reference later without disturbing the rest.
+
+**Version classification.** `@1.1.0` is a **minor** bump under the rules below:
+the `@1.0.0` functions and the `http-request-data` record are preserved and stay
+registered unchanged, so old capsules' bindings are unaffected; the new surface
+is reachable only through new functions and new-version types in a new frozen
+file. It is the first concrete exercise of the support-window question raised
+under Unresolved questions — the kernel will register
+`astrid:http@{1.0.0, 1.1.0}` simultaneously, and the `@1.0.0` shim is the first
+per-evolution host shim Rule 2 anticipates.
 
 ## Guest exports
 
