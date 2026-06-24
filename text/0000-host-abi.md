@@ -85,7 +85,7 @@ declarations, not merely documentation.
 ## Capability gating
 
 Every host function checks the calling capsule's declared capabilities before
-executing. A capsule without `fs_read` capability cannot call `astrid_fs_read`.
+executing. A capsule without `fs_read` capability cannot call `astrid:fs/host.read-file`.
 Violations are logged to the audit chain and return an error to the guest.
 
 ## Per-principal scoping
@@ -916,9 +916,10 @@ window.
 This evolution discipline governs the **kernel ↔ capsule** boundary — the WIT
 contract enforced by the wasmtime linker. It does **not** govern
 **capsule ↔ capsule** communication, which travels over the IPC bus as
-typed events on string topics (e.g. `tool.v1.execute.*`). The bus is not WIT-
-typed; capsule-to-capsule shape changes manifest at runtime as deserialization
-errors or unmatched subscriptions, not at load time as linker errors.
+typed events on string topics (e.g. `tool.v1.execute.*`). The bus schemas are
+WIT-defined (`interfaces/*.wit`) but are not enforced by the wasmtime linker, so
+capsule-to-capsule shape changes manifest at runtime as deserialization errors
+or unmatched subscriptions, not at load time as linker errors.
 
 Bus-event evolution is governed separately by the topic-versioning convention
 (`*.v1.*` → `*.v2.*`, with producers keeping the prior topic alive until
@@ -1047,11 +1048,13 @@ Gating these would add friction without security benefit.
   chokepoint, whether `allow_persistent` is a distinct operator sub-grant vs
   `host_process` alone, and whether macOS persistence ships behind the operator
   opt-in with a best-effort reaper or is gated on a stronger macOS reaper first.
+
+# Future possibilities
 [future-possibilities]: #future-possibilities
 
 - **Resource-typed caller-context.** Replace the payload-carried `principal`
   field with a host-owned resource handle exposed via accessor methods. This
-  removes a cross-cutting record type from `astrid:core` entirely, letting
+  removes a cross-cutting record type from `astrid:sys/host` entirely, letting
   the host evolve principal representation without any WIT payload change.
   See the corresponding open question.
 - **`astrid_system_stats` host function.** Runtime observability for the system
