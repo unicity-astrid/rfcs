@@ -71,7 +71,7 @@ You do not need an RFC for:
 
 ## How to submit
 
-1. Fork the [rfcs](https://github.com/unicity-astrid/rfcs) repository.
+1. Fork the [rfcs](https://github.com/astrid-runtime/rfcs) repository.
 2. Copy `0000-template.md` to `text/0000-my-feature.md` (descriptive name,
    do not assign an RFC number).
 3. Fill in the RFC. Focus on motivation and the reference-level specification.
@@ -128,7 +128,7 @@ RFCs use the template at `0000-template.md`. The header fields are:
 | Feature Name | A unique `snake_case` identifier. |
 | Start Date | The date the RFC was first submitted (YYYY-MM-DD). |
 | RFC PR | Link to the pull request(s) where the RFC was discussed. |
-| Tracking Issue | Link to the implementation tracking issue in `unicity-astrid/astrid`, if applicable. |
+| Tracking Issue | Link to the implementation tracking issue in `astrid-runtime/astrid`, if applicable. |
 
 ## Required sections
 
