@@ -1,6 +1,6 @@
 - Feature Name: `content_addressed_authority_profiles`
 - Start Date: 2026-07-14
-- RFC PR: [rfcs#0000](https://github.com/astrid-runtime/rfcs/pull/0000)
+- RFC PR: [rfcs#36](https://github.com/astrid-runtime/rfcs/pull/36)
 - Tracking Issue: [astrid#1228](https://github.com/astrid-runtime/astrid/issues/1228)
 
 # Summary
