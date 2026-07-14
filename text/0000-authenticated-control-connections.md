@@ -789,6 +789,8 @@ agent:prompt
 self:agent:prompt
 agent:requests:read
 self:agent:requests:read
+agent:events:read
+self:agent:events:read
 interaction:respond
 self:interaction:respond
 session:list
@@ -813,7 +815,7 @@ references their content-bound entries. They are privileged and nondelegable.
 
 Profile/authority repair, service/credential provisioning and
 `delegation:policy:manage` are nondelegable. The self-scoped prompt, request,
-interaction, session, model, capsule-inspection/configuration, audit and
+event, interaction, session, model, capsule-inspection/configuration, audit and
 identity-read entries, plus `self:delegation:policy:manage`, are included in the
 exact built-in `agent` revision. The `use-only` preset includes the safe run-time
 entries but excludes pairing, credential mutation, service provisioning and
@@ -918,9 +920,13 @@ agent.prompt@1 / agent.prompt-self@1
   -> agent:prompt / self:agent:prompt; D|G; stream
 agent.requests@1 / agent.requests-self@1
   -> agent:requests:read / self:agent:requests:read; D|G; stream
+agent.events@1 / agent.events-self@1
+  -> agent:events:read / self:agent:events:read; D|G; stream
 interaction.respond@1 / interaction.respond-self@1
   -> interaction:respond / self:interaction:respond; D|G; mutation
 session.list@1 / list-self@1
+  -> session:list / self:session:list; D|G; read-only
+session.search@1 / search-self@1
   -> session:list / self:session:list; D|G; read-only
 session.read@1 / read-self@1
   -> session:read / self:session:read; D|G; read-only
@@ -945,7 +951,9 @@ add provider-specific topics or an untyped registry escape hatch. A downstream
 distribution's generated route matrix must classify every route as
 distribution-owned, direct-service or delegated-subject and name the exact
 operation(s) above before that distribution's CLI or HTTP cutover starts. It is
-not an Astrid activation prerequisite.
+not an Astrid activation prerequisite. A distribution HTTP route that requests
+runtime-wide capsule reload binds `runtime.capsules.reload@1` as direct-service;
+it cannot relabel that direct-only operation as a delegated-subject request.
 
 Each manifest entry binds its exact DTOs, capabilities, host target extraction,
 mutation commit point, responder policy and legacy adapter mapping. Product HTTP
