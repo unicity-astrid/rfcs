@@ -1,6 +1,6 @@
 - Feature Name: `authenticated_control_connections`
 - Start Date: 2026-07-14
-- RFC PR: [rfcs#0000](https://github.com/astrid-runtime/rfcs/pull/0000)
+- RFC PR: [rfcs#37](https://github.com/astrid-runtime/rfcs/pull/37)
 - Tracking Issue: [astrid#1229](https://github.com/astrid-runtime/astrid/issues/1229)
 
 # Summary
