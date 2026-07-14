@@ -8,7 +8,7 @@
 
 Astrid will replace wildcard administrative authority with immutable,
 content-addressed authority profiles composed only of exact registered
-capabilities. The administrator profile has a stable name and a frozen reviewed
+capabilities. The administrator profile has a stable name and a frozen approved
 revision identified by its content digest; capabilities added later require an
 explicit profile update.
 
@@ -78,7 +78,7 @@ AuthorityProfileRef {
 The stable name `administrator` is not a mutable role. Its installed revision is
 the definition with a particular digest, and that definition never changes. A
 new runtime capability is not added to an existing revision. A later release can
-publish a new reviewed digest under the same stable name; an operator reviews the
+publish a new approved digest under the same stable name; an operator verifies the
 capability diff and explicitly updates selected principals, groups or
 credentials.
 
@@ -221,7 +221,7 @@ the authority digest. Every authorization-relevant capability semantic is covere
 by the bound entry digest. Adding a new registry entry does not invalidate an old
 profile; changing the meaning of an entry referenced by that profile does.
 
-Definitions are immutable and stored by `(id, digest)`. Multiple reviewed
+Definitions are immutable and stored by `(id, digest)`. Multiple approved
 revisions may share a stable ID, but the bytes at a given digest can never
 change. A reference whose digest is absent or does not match the canonical
 definition fails closed.
@@ -312,11 +312,11 @@ for `delegate:session:open`; the control manifest references but does not redecl
 them. Every derived entry and `delegate:session:open` has `privileged = true` and
 `delegable = false`. The sealed delegation evaluator accepts only these typed
 derived IDs by exact membership: legacy `*`, `delegate:*` and scoped patterns
-can never satisfy it. Profile management, recovery, credential issuance,
-service provisioning and any capability explicitly marked nondelegable have no
-derived delegation entry.
+can never satisfy it. Profile management, recovery, service provisioning,
+credential rotation or revocation, unattenuated device issuance and any
+capability explicitly marked nondelegable have no derived delegation entry.
 
-The migration-baseline capability manifest is generated once from the reviewed
+The migration-baseline capability manifest is generated once from the complete
 current enforcement inventory. It includes all current management capabilities,
 registered resource/uplink capabilities, `capsule:access:any`,
 `authority:profile:manage` and the online repair capability. It does not include
@@ -378,6 +378,92 @@ capsule:access:any
 authority:profile:manage
 authority:repair
 ```
+
+All 51 entries have `source = Kernel`. The remaining authorization semantics
+are fixed by this table; target kinds appear in their canonical numeric order.
+`G` means `Global`, `S` means `Self`, `D` means delegable and `P` means
+privileged.
+
+| Capability ID | Scope | Target kinds | D | P |
+|---|:---:|---|:---:|:---:|
+| `system:shutdown` | G | `System` | no | yes |
+| `system:status` | G | `System` | no | no |
+| `capsule:install` | G | `System, CapsulePackage` | yes | yes |
+| `self:capsule:install` | S | `Principal, CapsulePackage` | yes | no |
+| `capsule:reload` | G | `System, CapsuleInstance` | yes | yes |
+| `self:capsule:reload` | S | `Principal, CapsuleInstance` | yes | no |
+| `capsule:remove` | G | `System, CapsuleInstance` | yes | yes |
+| `self:capsule:remove` | S | `Principal, CapsuleInstance` | yes | no |
+| `self:workspace:promote` | S | `Principal, CapsuleInstance` | yes | no |
+| `self:workspace:rollback` | S | `Principal, CapsuleInstance` | yes | no |
+| `capsule:list` | G | `System` | yes | yes |
+| `self:capsule:list` | S | `Principal` | yes | no |
+| `agent:create` | G | `Principal, Group, CapsulePackage` | yes | yes |
+| `agent:create:inherit` | G | `Principal` | yes | yes |
+| `agent:create:clone` | G | `Principal, Group, CapsulePackage` | yes | yes |
+| `agent:delete` | G | `Principal` | yes | yes |
+| `agent:enable` | G | `Principal` | yes | yes |
+| `agent:disable` | G | `Principal` | yes | yes |
+| `agent:modify` | G | `Principal, Group, CapsulePackage` | yes | yes |
+| `agent:list` | G | `System` | yes | yes |
+| `self:agent:list` | S | `Principal` | yes | no |
+| `quota:set` | G | `Principal` | yes | yes |
+| `self:quota:set` | S | `Principal` | yes | yes |
+| `quota:get` | G | `Principal` | yes | yes |
+| `self:quota:get` | S | `Principal` | yes | no |
+| `group:create` | G | `Group` | yes | yes |
+| `group:delete` | G | `Group` | yes | yes |
+| `group:modify` | G | `Group` | yes | yes |
+| `group:list` | G | `System` | yes | yes |
+| `self:group:list` | S | `Principal` | yes | no |
+| `caps:grant` | G | `Principal` | yes | yes |
+| `caps:revoke` | G | `Principal` | yes | yes |
+| `caps:token:mint` | G | `Principal, Credential` | yes | yes |
+| `caps:token:revoke` | G | `Principal, Credential` | yes | yes |
+| `caps:token:list` | G | `Principal` | yes | yes |
+| `invite:issue` | G | `Group, Credential` | yes | yes |
+| `invite:redeem` | G | `Principal, Group, Credential` | no | yes |
+| `invite:list` | G | `System` | yes | yes |
+| `invite:revoke` | G | `Credential` | yes | yes |
+| `audit:read_all` | G | `AuditScope` | yes | yes |
+| `self:approval:respond` | S | `Principal` | yes | no |
+| `self:auth:pair` | S | `Principal, Credential` | yes | yes |
+| `self:auth:pair:admin` | S | `Principal, Credential` | no | yes |
+| `auth:pair:redeem` | G | `Principal, Credential` | no | yes |
+| `auth:pair` | G | `Principal, Credential` | yes | yes |
+| `system:resources:unbounded` | S | `Principal, CapsuleInstance` | no | yes |
+| `net_bind` | S | `Principal, CapsuleInstance` | no | yes |
+| `uplink` | S | `Principal, CapsuleInstance` | no | yes |
+| `capsule:access:any` | S | `CapsulePackage, CapsuleInstance` | no | yes |
+| `authority:profile:manage` | G | `System, Principal, Group, Credential` | no | yes |
+| `authority:repair` | G | `System, Principal, Group, Credential` | no | yes |
+
+`privileged = true` means conferral can enable cross-principal control or
+visibility, mutate authority or credentials, change system integrity or
+availability, relax operator resource controls, bypass an isolation boundary or
+read global audit data. It governs assignment and profile mutation; it does not
+replace the capability's ordinary operation check.
+
+`Credential` includes device and service credentials, invitation and pair
+tokens, and signed resource-capability tokens. Collection-wide list operations
+target `System`; self-scoped list operations target the subject `Principal`.
+Workspace operations target the subject and the affected `CapsuleInstance`.
+Package installation targets `CapsulePackage`, while reload and removal target
+`CapsuleInstance`. `capsule:access:any` covers package and instance identities.
+
+The holder-scoped resource, bind and uplink entries are nondelegable. Their
+current resource-exemption checks do not by themselves authorize socket binding
+or uplink registration; those enforcement sites must bind the same content-bound
+entry before activation. `capsule:access:any` is a nested subject-side access
+check, not primary delegated-operation authority. `self:auth:pair` permits an
+attenuated device issued for the subject; a `Full` device additionally requires
+nondelegable `self:auth:pair:admin`, making that request direct. Redeem entries
+are internal enrollment actions and require token possession and proof.
+
+The six entries absent from the current display catalog use `Extreme` danger:
+`system:resources:unbounded`, `net_bind`, `uplink`, `capsule:access:any`,
+`authority:profile:manage` and `authority:repair`. Danger remains display-only
+and is excluded from entry and manifest digests.
 
 One initially activated `administrator` profile is generated from the union of
 this baseline and the companion control-operation capability manifest, excluding
@@ -628,7 +714,7 @@ rotation/revocation during the next migration.
 ## Bootstrap transaction
 
 Fresh bootstrap writes principal identity, active credential and
-the reviewed `administrator` digest through one logical transaction/journal.
+the pinned `administrator` digest through one logical transaction/journal.
 Startup continues only after reloading and verifying all three. An existing
 installation with partial bootstrap state fails with a recovery instruction
 instead of silently reseeding authority.
@@ -644,7 +730,7 @@ ordinary clients or services.
 
 Astrid exposes one narrow online `administrator.repair` transaction. It may
 atomically create or re-enable one principal, register a proof-of-possession
-credential for it and assign one already installed, reviewed `administrator`
+credential for it and assign one already installed, approved `administrator`
 digest. It cannot assign arbitrary profiles, invoke capsules or change unrelated
 policy. The caller must hold both content-bound `authority:repair` and
 `authority:profile:manage`; the operation is nondelegable and its ordinary and
@@ -823,7 +909,7 @@ each actual old store deserializer.
 
 - Capability registration and immutable profiles add maintenance work whenever
   enforcement changes.
-- Administrators must explicitly review profile updates to gain new powers.
+- Administrators must explicitly approve profile updates to gain new powers.
 - The migration is substantially more complex than replacing `*` in one group.
 - Exact expansion can produce larger stored policy sets.
 - Last-administrator protection and offline recovery add transaction paths that
@@ -846,11 +932,11 @@ of who currently holds the pattern.
 
 **Why exact capabilities instead of scoped patterns such as `self:*`?** A pattern
 can inherit a future capability in its namespace. Exact stored authority makes
-the review boundary deterministic. IPC topic patterns and resource-token globs
+the change boundary deterministic. IPC topic patterns and resource-token globs
 remain separate, purpose-built namespaces.
 
 **Why a complete registry?** Unregistered enforcement is invisible to profile
-review and migration. The current wildcard-only bypasses demonstrate that a
+enumeration and migration. The current wildcard-only bypasses demonstrate that a
 partial catalog cannot prove completeness.
 
 **Why a separate profile-management capability?** `agent:create` should not imply
