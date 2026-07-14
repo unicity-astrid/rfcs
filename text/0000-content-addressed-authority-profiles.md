@@ -71,7 +71,7 @@ An authority profile is a named, content-addressed set of exact capability IDs:
 ```text
 AuthorityProfileRef {
     id: "administrator",
-    digest: sha256(canonical profile definition)
+    digest: blake3(canonical profile definition)
 }
 ```
 
@@ -191,7 +191,7 @@ AuthorityProfileDefinition {
     id: AuthorityProfileId,
     capabilities: sorted set<CapabilityRef>,
     created_by_release: string,
-    digest_algorithm: "sha256",
+    digest_algorithm: "blake3",
     digest: 32 bytes,
 }
 
@@ -211,7 +211,7 @@ Capability entries are concrete validated IDs and may not contain any wildcard
 segment. The canonical digest is:
 
 ```text
-SHA-256("astrid-authority-profile\0" || deterministic-CBOR(
+BLAKE3("astrid-authority-profile\0" || deterministic-CBOR(
     id, created_by_release, sorted capability ID + entry-digest bindings
 ))
 ```
@@ -225,6 +225,10 @@ Definitions are immutable and stored by `(id, digest)`. Multiple approved
 revisions may share a stable ID, but the bytes at a given digest can never
 change. A reference whose digest is absent or does not match the canonical
 definition fails closed.
+
+BLAKE3 is fixed by the authority-profile and capability-registry schemas. An
+algorithm change requires a new schema revision; implementations never infer an
+algorithm from digest length.
 
 ## Registered capability schema
 
@@ -245,7 +249,7 @@ RegisteredCapability {
 CapabilityRegistryManifest {
     schema_revision: nonzero u32,
     entries: sorted set<RegisteredCapability>,
-    digest_algorithm: "sha256",
+    digest_algorithm: "blake3",
     digest: 32 bytes,
 }
 ```
@@ -275,12 +279,13 @@ Scope tags are `0 = Self` and `1 = Global`. Target-kind tags are
 `4 = CapsulePackage`, `5 = CapsuleInstance`, `6 = ApplicationSession`,
 `7 = Model` and `8 = AuditScope`. The source tuple is `[0]` for `Kernel` or
 `[1, package-digest]` for `SignedExtension`, where `package-digest` is a
-32-byte CBOR byte string. Danger, labels and descriptions are not encoded.
+32-byte BLAKE3 digest encoded as a CBOR byte string. Danger, labels and
+descriptions are not encoded.
 
 The entry digest is:
 
 ```text
-SHA-256("astrid-capability-entry\0" || entry-encoding)
+BLAKE3("astrid-capability-entry\0" || entry-encoding)
 ```
 
 The manifest encoding is the definite-length CBOR array
@@ -289,7 +294,7 @@ encoded using the same six-item form. A manifest may contain only one entry for
 an ID. The manifest digest is:
 
 ```text
-SHA-256("astrid-capability-registry\0" || manifest-encoding)
+BLAKE3("astrid-capability-registry\0" || manifest-encoding)
 ```
 
 Both encodings use shortest-form unsigned integers and lengths, definite-length
