@@ -257,6 +257,45 @@ target class, resource exemption or delegation meaning requires a new capability
 ID. Authorization-relevant meaning under an existing ID is immutable; a release
 that presents the same ID with a different entry digest fails closed.
 
+The entry encoding is a definite-length six-item CBOR array:
+
+```text
+[
+  exact capability ID as UTF-8 text,
+  scope tag,
+  target-kind tags sorted by numeric tag,
+  delegable boolean,
+  privileged boolean,
+  source tuple
+]
+```
+
+Scope tags are `0 = Self` and `1 = Global`. Target-kind tags are
+`0 = System`, `1 = Principal`, `2 = Group`, `3 = Credential`,
+`4 = CapsulePackage`, `5 = CapsuleInstance`, `6 = ApplicationSession`,
+`7 = Model` and `8 = AuditScope`. The source tuple is `[0]` for `Kernel` or
+`[1, package-digest]` for `SignedExtension`, where `package-digest` is a
+32-byte CBOR byte string. Danger, labels and descriptions are not encoded.
+
+The entry digest is:
+
+```text
+SHA-256("astrid-capability-entry\0" || entry-encoding)
+```
+
+The manifest encoding is the definite-length CBOR array
+`[schema-revision, entries]`, with entries sorted by exact capability ID and
+encoded using the same six-item form. A manifest may contain only one entry for
+an ID. The manifest digest is:
+
+```text
+SHA-256("astrid-capability-registry\0" || manifest-encoding)
+```
+
+Both encodings use shortest-form unsigned integers and lengths, definite-length
+arrays, canonical UTF-8 text and raw byte strings. They contain no maps, CBOR
+tags, floating-point values or indefinite-length items.
+
 Every production call to the static authority evaluator accepts a typed
 `CapabilityRef { id, entry_digest }`, not an arbitrary string or bare ID. Raw
 strings exist only at the legacy parser/migration boundary and bind to the
