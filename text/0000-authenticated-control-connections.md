@@ -731,8 +731,13 @@ transcript.
 Delegability has one source of truth: the registry entry bound by
 `primary_capability`. `allowed_modes` may further remove delegated mode but
 cannot add it. An operation with a nondelegable conditional capability is itself
-nondelegable. Profile management, administrator repair, credential issuance,
-service provisioning and recovery operations therefore exclude `Delegated`.
+nondelegable. Profile management, administrator repair, service provisioning,
+credential rotation or revocation, unattenuated pairing and recovery operations
+therefore exclude `Delegated`. Self-scoped attenuated pair-token issue may use
+delegated mode because the host binds the new device to the subject and proves
+its scope cannot exceed the subject's effective authority. Requesting `Full`
+adds the nondelegable `self:auth:pair:admin` conditional and makes that request
+direct.
 
 The initial neutral operation inventory covers:
 
@@ -740,12 +745,14 @@ The initial neutral operation inventory covers:
 - principal list/get/create/update/delete/enable/disable;
 - device and credential list, rotation and revocation;
 - capability catalog, effective-authority inspection, grant and revoke;
+- signed resource-capability token list, mint and revoke;
 - quota get/set and usage;
 - group list/create/update/delete;
-- invitation and pair-token issue/list/revoke, with redemption confined to the
-  enrollment handshake;
+- invitation issue/list/revoke, self-scoped pair-token issue and operator
+  pair-token list/revoke, with redemption confined to the enrollment handshake;
 - capsule list/get/install/reload/remove, topic/schema inspection and environment
   configuration;
+- caller-owned workspace promote and rollback;
 - audit query and authorized event subscription;
 - agent prompt/request/event streams and typed interaction responses;
 - application-session list/search/get/update/delete and message history;
@@ -819,9 +826,9 @@ event, interaction, session, model, capsule-inspection/configuration, audit and
 identity-read entries, plus `self:delegation:policy:manage`, are included in the
 exact built-in `agent` revision. The `use-only` preset includes the safe run-time
 entries but excludes pairing, credential mutation, service provisioning and
-delegation. The reviewed
-`administrator` revision includes every base and control capability except
-`delegate:session:open` and generated `delegate:C` service grants; an
+delegation. The `administrator` revision includes every base and control
+capability except `delegate:session:open` and generated `delegate:C` service
+grants; an
 administrator can assign those deliberately through profile management without
 receiving service authority itself.
 
@@ -839,6 +846,9 @@ runtime.capsules.reload@1
 
 capability.catalog@1
   -> capability:catalog:read; D|G; read-only
+capability-token.list@1 / mint@1 / revoke@1
+  -> caps:token:list / caps:token:mint / caps:token:revoke; D;
+     read-only / mutation / mutation, nondelegable
 authority.read@1 / authority.read-self@1
   -> authority:read / self:authority:read; D|G; read-only
 authority.profile.list@1, authority.profile.diff@1
@@ -875,9 +885,11 @@ group.create@1 / update@1 / delete@1
 invitation.issue@1 / list@1 / revoke@1
   -> invite:issue / invite:list / invite:revoke; D|G;
      profile-manage-if-privileged
-pair-token.issue@1 / list@1 / revoke@1
-  -> auth:pair / auth:pair:list / auth:pair:revoke; D|G;
-     profile-manage-if-privileged
+pair-token.issue-self@1
+  -> self:auth:pair; D|G; mutation;
+     +self:auth:pair:admin and D-only when the requested scope is Full
+pair-token.list@1 / revoke@1
+  -> auth:pair:list / auth:pair:revoke; D|G; read-only / mutation
 
 device.list@1 / device.list-self@1
   -> device:list / self:device:list; D|G; read-only
@@ -911,6 +923,8 @@ capsule.config.read@1 / read-self@1
   -> capsule:config:read / self:capsule:config:read; D|G; read-only
 capsule.config.write@1 / write-self@1
   -> capsule:config:write / self:capsule:config:write; D|G; mutation
+workspace.promote-self@1 / rollback-self@1
+  -> self:workspace:promote / self:workspace:rollback; D; mutation
 
 audit.query@1 / audit.query-self@1
   -> audit:read_all / self:audit:read; D|G; read-only
@@ -1255,6 +1269,12 @@ lacks a trustworthy correlation field, the adapter permits only one in-flight
 request of that class on the connection; a second fails with backpressure rather
 than using principal-wide routing. Legacy application session IDs remain typed
 `ApplicationSessionId` data and never select an external connection.
+
+Legacy `auth:pair` device-management requests translate to the direct form of
+`device.list` or `device.revoke`; the adapter does not reuse `auth:pair` as a
+pair-token issue capability. Legacy `self:approval:respond` requests translate
+to `interaction.respond-self` after the host binds the exact pending
+interaction. Neither legacy capability is assigned to a new delegated service.
 
 The WASM CLI proxy remains in an upgrade fixture until signed old clients, new
 clients, clean installs and packaged in-place upgrades pass the same operation
