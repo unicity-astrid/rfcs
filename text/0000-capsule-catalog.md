@@ -1,6 +1,6 @@
 - Feature Name: `capsule_catalog`
 - Start Date: 2026-07-26
-- RFC PR: [rfcs#0000](https://github.com/astrid-runtime/rfcs/pull/0000)
+- RFC PR: [rfcs#38](https://github.com/astrid-runtime/rfcs/pull/38)
 - Tracking Issue: [astrid#0000](https://github.com/astrid-runtime/astrid/issues/0000)
 
 # Summary
